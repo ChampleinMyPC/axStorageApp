@@ -1,9 +1,0 @@
-PACKAGENAME="axstorage"
-APPNAME="axstorage"
-VENDOR="Axis Communications"
-REQEMBDEVVERSION="3.0"
-VENDORHOMEPAGELINK='<a href="https://www.axis.com" target="_blank">www.axis.com</a>'
-STARTMODE="never"
-APPMAJORVERSION="1"
-APPMINORVERSION="3"
-APPMICROVERSION="0"

@@ -13,11 +13,11 @@
         "setup": {
             "friendlyName": "axstorage",
             "appName": "axstorage",
-            "vendor": "Axis Communications",
+            "vendor": "MyPC Software T.Y.C.",
             "embeddedSdkVersion": "3.0",
-            "vendorUrl": "https://www.axis.com",
+            "vendorUrl": "https://www.mypeoplecounter.com/fr/",
             "runMode": "never",
-            "version": "1.3.0"
+            "version": "1.4.2"
         }
     }
 }
