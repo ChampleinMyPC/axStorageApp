@@ -9,8 +9,22 @@
 #include <syslog.h>
 
 #include <curl/curl.h>
+#define HTTP_TARGET "http://192.168.1.104:3000/api/enregistrements/ingest-batch-from-acap"
+#define USER "champlein"
+#define PASS "696969"
+#define NUM_SCENARIO_DIR1_OU_DVG "4"  // <- à adapter selon ton scénario de comptage SUR LA CAMERA 
+#define NUM_SCENARIO_DIR2_OU_GVD "2"  // <- à adapter selon ton scénario de comptage SUR LA CAMERA 
+/* NEW: numéro de série global, utilisé aux flush 15' et on SIGTERM */
+static char g_camera_serial[64] = "camera_name"; // par défaut
 static void verify_latest_json_on_all_disks_for_serial(const char* camera_serial);
 static void write_block_json_to_sd(const char* serial);
+static void day_string_europe_paris(GDateTime **now_local_out, char out_day[11]);
+static gboolean get_camera_serial(char out[64]);
+static void try_ship_file_to_node(const char* filepath, const char* node_url, const char* api_key);
+static gboolean http_post_json(const char* url, const char* api_key, const char* json, long* http_code_out);
+// static void  curl_test_get_jsonplaceholder(void);
+static void list_all_files_with_parent(const char *root_dir);
+static void resend_pending_today(const char* base_dir, const char* serial, const char* url, const char* api_key);
 // static void verify_latest_json_on_all_disks_for(const char *scenario_str); // debug
 /*** ---- CURL buffer (reprend ton hello.c) ---- ***/
 struct MemoryStruct
@@ -19,8 +33,6 @@ struct MemoryStruct
   size_t size;
 };
 
-/* NEW: numéro de série global, utilisé aux flush 15' et on SIGTERM */
-static char g_camera_serial[64] = "ma_camra_b8...ce99"; // par défaut
 // static char g_camera_serial[64] = "axis-b8a44f46ce99"; // par défaut
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
 {
@@ -130,34 +142,6 @@ static void put_delta_in_minute(GDateTime* now_utc, DirKind dir, const ClassTota
   else             { g_block.m[idx].dir2 = *delta; g_block.m[idx].has_dir2 = TRUE; }
 }
 
-/* tronque un timestamp UTC à un multiple de 15 min */
-// static GDateTime* floor_to_15min(GDateTime* t) {
-//   int min = g_date_time_get_minute(t);
-//   int flo = (min/15)*15;
-//   return g_date_time_new_utc(
-//     g_date_time_get_year(t), g_date_time_get_month(t), g_date_time_get_day_of_month(t),
-//     g_date_time_get_hour(t), flo, 0);
-// }
-
-/* retourne l’index 0..14 pour la minute courante dans la fenêtre */
-// static int minute_index_in_block(GDateTime* now_utc) {
-//   int m = g_date_time_get_minute(now_utc);
-//   return m % 15;
-// }
-
-/* ISO helpers */
-// static void iso_min_bounds(GDateTime* t_utc, char out_from[32], char out_to[32]) {
-//   GDateTime* from = g_date_time_new_utc(
-//     g_date_time_get_year(t_utc), g_date_time_get_month(t_utc), g_date_time_get_day_of_month(t_utc),
-//     g_date_time_get_hour(t_utc), g_date_time_get_minute(t_utc), 0);
-//   GDateTime* to = g_date_time_add_seconds(from, 60);
-//   gchar* f = g_date_time_format(from, "%Y-%m-%dT%H:%M:%SZ");
-//   gchar* t = g_date_time_format(to,   "%Y-%m-%dT%H:%M:%SZ");
-//   g_strlcpy(out_from, f, 32);
-//   g_strlcpy(out_to,   t, 32);
-//   g_free(f); g_free(t);
-//   g_date_time_unref(from); g_date_time_unref(to);
-// }
 /* --- parse cumul depuis la réponse (sscanf naïf, suffisant pour ce JSON) --- */
 static void parse_cumul_totals(const char* json, ClassTotals* out, char reset_time[40]) {
   memset(out, 0, sizeof(*out));
@@ -176,19 +160,6 @@ static void parse_cumul_totals(const char* json, ClassTotals* out, char reset_ti
   if ((p=strstr(json,"\"total\"")))           sscanf(p, "\"total\"%*[^0-9]%d", &out->total);
 }
 
-/* delta = cumul_now - g_prev (>=0) */
-// static ClassTotals compute_delta(const ClassTotals* now) {
-//   ClassTotals d = {
-//     .car   = (now->car   >= g_prev.car   ? now->car   - g_prev.car   : 0),
-//     .bike  = (now->bike  >= g_prev.bike  ? now->bike  - g_prev.bike  : 0),
-//     .truck = (now->truck >= g_prev.truck ? now->truck - g_prev.truck : 0),
-//     .bus   = (now->bus   >= g_prev.bus   ? now->bus   - g_prev.bus   : 0),
-//     .human = (now->human >= g_prev.human ? now->human - g_prev.human : 0),
-//     .other = (now->other >= g_prev.other ? now->other - g_prev.other : 0),
-//     .total = (now->total >= g_prev.total ? now->total - g_prev.total : 0),
-//   };
-//   return d;
-// }
 
 /*** ---- AXStorage state (inspiré du sample Axis) ---- ***/
 typedef struct
@@ -223,7 +194,7 @@ static gboolean signal_handler(gpointer user_data)
 {
   (void)user_data;
   if (loop){
-    if (g_block.block_start_utc) write_block_json_to_sd(g_camera_serial);
+    if (g_block.block_start_utc && get_camera_serial(g_camera_serial)) write_block_json_to_sd(g_camera_serial);
     g_main_loop_quit(loop);
   }
   syslog(LOG_INFO, "Stopping (signal).");
@@ -349,124 +320,57 @@ static void subscribe_cb(gchar *storage_id, gpointer user_data, GError *error)
       syslog(LOG_WARNING, "setup err: %s", axerr->message);
       g_clear_error(&axerr);
     }
+        char serial[64]={0};
+        if (!get_camera_serial(serial)) strcpy(serial,"unknown_camera");
+        syslog(LOG_INFO, "Resending pending files for serial %s", serial);
+        resend_pending_today(d->storage_path, serial, HTTP_TARGET, NULL);
+
+    // g_timeout_add_seconds(5, (GSourceFunc)curl_test_get_jsonplaceholder, NULL);
+      // après setup AXStorage, par ex.:
+    const char *base = "/var/spool/storage/areas/SD_DISK/axstorage/aoa_counts";
+    list_all_files_with_parent(base);
+  
   }
 }
-
-/*** ---- Helper: écriture JSON sur tous les disques prêts ---- ***/
-// static void write_json_on_all_disks(const char *basename, const char *json, const char *scenario_str)
-// {
-//   for (GList *n = g_list_first(disks_list); n != NULL; n = g_list_next(n))
-//   {
-//     disk_item_t *d = n->data;
-//     if (!d->available || !d->writable || d->full || !d->setup || !d->storage_path)
-//       continue;
-
-//     // Dossier dédié au scénario
-//     gchar *outdir = g_strdup_printf("%s/aoa_counts/scenario_%s", d->storage_path, scenario_str);
-//     g_mkdir_with_parents(outdir, 0775);
-
-//     // fichier horodaté
-//     GDateTime *now = g_date_time_new_now_utc();
-//     gchar *ts = g_date_time_format(now, "%Y%m%dT%H%M%SZ");
-//     gchar *path = g_strdup_printf("%s/%s_%s.json", outdir, basename, ts);
-
-//     FILE *f = g_fopen(path, "w");
-//     if (!f)
-//     {
-//       syslog(LOG_WARNING, "open %s failed", path);
-//     }
-//     else
-//     {
-//       g_fprintf(f, "%s\n", json);
-//       fclose(f);
-//       syslog(LOG_INFO, "Wrote %s", path);
-//     }
-//     g_free(path);
-//     g_free(ts);
-//     g_free(outdir);
-//     g_date_time_unref(now);
-//   }
-// }
 static void write_json_on_all_disks_serial(const char* basename,
                                            const char* json,
                                            const char* camera_serial) {
   for (GList* n = g_list_first(disks_list); n; n = g_list_next(n)) {
     disk_item_t* d = n->data;
     if (!d->available || !d->writable || d->full || !d->setup || !d->storage_path) continue;
-    gchar* outdir = g_strdup_printf("%s/aoa_counts/%s", d->storage_path, camera_serial);
+    // gchar* outdir = g_strdup_printf("%s/aoa_counts/%s", d->storage_path, camera_serial);
+    // g_mkdir_with_parents(outdir, 0775);
+    // GDateTime* now = g_date_time_new_now_utc();
+    // gchar* ts = g_date_time_format(now, "%Y%m%dT%H%M%SZ");
+    // gchar* path = g_strdup_printf("%s/%s_%s.json", outdir, basename, ts);
+    
+    // 1) dossier par jour (Europe/Paris)
+    char ymd[11]; GDateTime *now_local = NULL;
+    day_string_europe_paris(&now_local, ymd);                  // "YYYY-MM-DD"
+    gchar* outdir = g_strdup_printf("%s/aoa_counts/%s/%s",
+                                    d->storage_path, camera_serial, ymd);
     g_mkdir_with_parents(outdir, 0775);
-    GDateTime* now = g_date_time_new_now_utc();
-    gchar* ts = g_date_time_format(now, "%Y%m%dT%H%M%SZ");
+    // 2) nom horodaté (UTC pour l’unicité)
+    GDateTime* now_utc = g_date_time_new_now_utc();
+    gchar* ts = g_date_time_format(now_utc, "%Y%m%dT%H%M%SZ");
     gchar* path = g_strdup_printf("%s/%s_%s.json", outdir, basename, ts);
     FILE* f = g_fopen(path, "w");
     if (f) { g_fprintf(f, "%s\n", json); fclose(f); syslog(LOG_INFO, "Wrote %s", path); }
     else   { syslog(LOG_WARNING, "open %s failed", path); }
-    g_free(path); g_free(ts); g_free(outdir); g_date_time_unref(now);
+    g_free(path); g_free(ts); g_free(outdir); 
+    g_date_time_unref(now_local);
+    g_date_time_unref(now_utc);
   }
 }
 
-// static void write_block_json_to_sd_with_scenario(const char* scenario_str) {
-//   if (!g_block.block_start_utc || g_block.filled==0) return;
-  //   // JSON: on inclut "scenario"
-  //   GString* js = g_string_new(NULL);
-  //   g_string_append_printf(js,
-  //     "{"
-  //       "\"scenario\":\"%s\","
-  //       "\"sensor-time\":{\"timezone\":\"Europe/Paris\"},"
-  //       "\"content\":{\"element\":[{"
-  //         "\"element-id\":0,"
-  //         "\"data-type\":\"LINE\","
-  //         "\"resolution\":\"ONE_MINUTE\","
-  //         "\"measurement\":[",
-  //     scenario_str
-  //   );
-
-  //   for (int i=0;i<15;i++){
-  //     if (!g_block.m[i].filled) continue;
-  //     if (i>0) g_string_append(js, ",");
-  //     g_string_append_printf(js,
-  //       "{"
-  //         "\"from\":\"%s\",\"to\":\"%s\","
-  //         "\"value\":["
-  //           "{\"label\":\"car\",\"value\":%d},"
-  //           "{\"label\":\"bike\",\"value\":%d},"
-  //           "{\"label\":\"truck\",\"value\":%d},"
-  //           "{\"label\":\"bus\",\"value\":%d},"
-  //           "{\"label\":\"human\",\"value\":%d},"
-  //           "{\"label\":\"other\",\"value\":%d},"
-  //           "{\"label\":\"total\",\"value\":%d}"
-  //         "]"
-  //       "}",
-  //       g_block.m[i].from_iso, g_block.m[i].to_iso,
-  //       g_block.m[i].delta.car, g_block.m[i].delta.bike, g_block.m[i].delta.truck,
-  //       g_block.m[i].delta.bus, g_block.m[i].delta.human, g_block.m[i].delta.other,
-  //       g_block.m[i].delta.total
-  //     );
-  //   }
-  //   g_string_append(js, "]}}]}");
-
-  //   // Nom de fichier: counts_<SCENARIO>_<startUTC>_15min.json
-  //   gchar* start_str = g_date_time_format(g_block.block_start_utc, "%Y%m%dT%H%MZ");
-  //   gchar* fname = g_strdup_printf("counts_%s_%s_15min", scenario_str, start_str);
-  //   write_json_on_all_disks(fname, js->str, scenario_str);
-  //   g_free(start_str); g_free(fname);
-  //   g_string_free(js, TRUE);
-  // }
-
-/* démarre une nouvelle fenêtre 15 min et vide le buffer */
-// static void start_new_block(GDateTime* start_utc) {
-//   if (g_block.block_start_utc) g_date_time_unref(g_block.block_start_utc);
-//   memset(&g_block, 0, sizeof(g_block));
-//   g_block.block_start_utc = g_date_time_ref(start_utc);
-// }
-static gboolean get_camera_serial(char out[64], const char* user, const char* pass) {
+static gboolean get_camera_serial(char out[64]) {
   // VAPIX: /axis-cgi/param.cgi?action=list&group=Properties.System.SerialNumber
   CURL* c = curl_easy_init(); if(!c) return FALSE;
   struct MemoryStruct buf = {0};
   char url[256]; snprintf(url,sizeof url,"http://127.0.0.1/axis-cgi/param.cgi?action=list&group=Properties.System.SerialNumber");
   curl_easy_setopt(c, CURLOPT_URL, url);
-  curl_easy_setopt(c, CURLOPT_USERNAME, user);
-  curl_easy_setopt(c, CURLOPT_PASSWORD, pass);
+  curl_easy_setopt(c, CURLOPT_USERNAME,  USER);
+  curl_easy_setopt(c, CURLOPT_PASSWORD, PASS);
   curl_easy_setopt(c, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
   curl_easy_setopt(c, CURLOPT_WRITEDATA, &buf);
@@ -480,6 +384,8 @@ static gboolean get_camera_serial(char out[64], const char* user, const char* pa
     // copie jusqu'à fin de ligne
     size_t i=0; while (p[i] && p[i]!='\r' && p[i]!='\n' && i<63) { out[i]=p[i]; i++; }
     out[i]='\0'; ok = (i>0);
+    //on affiche le nom de la camera dans les log
+    syslog(LOG_INFO,"\n\nle nom de la camera dans get serial est %s\n\n",out);
   }
   free(buf.memory); curl_easy_cleanup(c);
   return ok;
@@ -494,7 +400,7 @@ static void write_block_json_to_sd(const char* serial) {
       "\"cameraSerial\":\"%s\","
       "\"sensor-time\":{\"timezone\":\"Europe/Paris\"},"
       "\"content\":{\"element\":[{"
-        "\"element-id\":0,"
+        "\"roi-id\":1,"
         "\"data-type\":\"LINE\","
         "\"resolution\":\"ONE_MINUTE\","
         "\"measurement\":[",
@@ -522,7 +428,7 @@ static void write_block_json_to_sd(const char* serial) {
       "{"
         "\"from\":\"%s\",\"to\":\"%s\","
         "\"counts\":{"
-          "\"dir1\":["
+          "\"dvg\":["
             "{\"label\":\"car\",\"value\":%d},"
             "{\"label\":\"bike\",\"value\":%d},"
             "{\"label\":\"truck\",\"value\":%d},"
@@ -530,7 +436,7 @@ static void write_block_json_to_sd(const char* serial) {
             "{\"label\":\"human\",\"value\":%d},"
             "{\"label\":\"other\",\"value\":%d}"
           "],"
-          "\"dir2\":["
+          "\"gvd\":["
             "{\"label\":\"car\",\"value\":%d},"
             "{\"label\":\"bike\",\"value\":%d},"
             "{\"label\":\"truck\",\"value\":%d},"
@@ -559,14 +465,16 @@ static void write_block_json_to_sd(const char* serial) {
       tot.car, tot.bike, tot.truck, tot.bus, tot.human, tot.other
     );
   }
-  g_string_append(js, "]}}]}");
+  g_string_append(js, "]}]}}");
 
   // nom de fichier basé sur le début de tranche 15’, sans “scenario”
   gchar* start_str = g_date_time_format(g_block.block_start_utc, "%Y%m%dT%H%MZ");
   gchar* fname = g_strdup_printf("counts_%s_%s_15min", serial?serial:"unknown", start_str);
 
   // réutilise ta fonction d’écriture (dossier unique aoa_counts/)
+  syslog(LOG_INFO, "ON ECRIT LE BLOCK DE 15 SUR EL DISK");
   write_json_on_all_disks_serial(fname, js->str,serial);  // même signature qu’actuelle sans “scenario”
+  syslog(LOG_INFO, "FIN ECRITURE LE BLOCK DE 15 SUR LE DISK \n");
   syslog(LOG_INFO, "AVANT LAPPEL DE VERIF POUR SERIAL ");
 
   verify_latest_json_on_all_disks_for_serial(serial); // debug
@@ -577,7 +485,7 @@ static void write_block_json_to_sd(const char* serial) {
   g_date_time_unref(g_block.block_start_utc);
   memset(&g_block, 0, sizeof(g_block));
 }
-static void maybe_flush_15min(const char* user, const char* pass) {
+static void maybe_flush_15min(void) {
   if (!g_block.block_start_utc) return;
   
   // si la minute courante est le début d’une nouvelle tranche 15’, on flush l’ancienne
@@ -594,9 +502,14 @@ static void maybe_flush_15min(const char* user, const char* pass) {
        g_date_time_get_minute(now),
        g_date_time_get_minute(g_block.block_start_utc));
   if (tranche_change) {
+      syslog(LOG_INFO, "la tranche a changé on écrit le block de 15");
+
     char serial[64]={0};
-    if (!get_camera_serial(serial, user, pass)) strcpy(serial,"unknown");
+    if (!get_camera_serial(serial)) strcpy(serial,"unknown");
     write_block_json_to_sd(serial);
+    // après écriture locale:
+    // on peut envoyer le fichier au node (si on a une API_KEY)
+
     // la prochaine insertion recréera un nouveau bloc dans ensure_block_for_now()
   }
   g_date_time_unref(now);
@@ -662,37 +575,35 @@ static void read_and_print_file(const gchar *filepath)
 }
 
 /* --- Vérifie tous les disques connus et affiche le dernier JSON écrit --- */
-// static void verify_latest_json_on_all_disks_for(const char *scenario_str)
-// {
-//   for (GList *n = g_list_first(disks_list); n != NULL; n = g_list_next(n))
-//   {
-//     disk_item_t *d = n->data;
-//     if (!d || !d->storage_path)
-//       continue;
-
-//     gchar *dir = g_strdup_printf("%s/aoa_counts/scenario_%s", d->storage_path, scenario_str);
-//     gchar *latest = find_latest_json_in_dir(dir);
-//     if (latest)
-//       read_and_print_file(latest);
-//     else
-//       g_printerr("No JSON file found in %s\n", dir);
-//     g_free(latest);
-//     g_free(dir);
-//   }
-// }
 /* nouvelle vérif “par serial” */
 static void verify_latest_json_on_all_disks_for_serial(const char* camera_serial) {
   // afficher un message de debug ici 
+  syslog(LOG_INFO, "ON ENTRE DANS LA FONCTION VERIFY");
+
   syslog(LOG_INFO, "Verifying latest JSON files for camera serial: %s", camera_serial);
   // g_print("\n=== Verifying latest JSON files for camera serial:  ===\n", camera_serial);
   for (GList* n = g_list_first(disks_list); n; n = g_list_next(n)) {
     disk_item_t* d = n->data;
     if (!d || !d->storage_path) continue;
-    gchar* dir = g_strdup_printf("%s/aoa_counts/%s", d->storage_path, camera_serial);
+    // gchar* dir = g_strdup_printf("%s/aoa_counts/%s", d->storage_path, camera_serial);
+    // cible le dossier du jour courant (Europe/Paris)
+    char ymd[11]; GDateTime *now_local = NULL;
+    day_string_europe_paris(&now_local, ymd);
+    gchar* dir = g_strdup_printf("%s/aoa_counts/%s/%s", d->storage_path, camera_serial, ymd);
     gchar* latest = find_latest_json_in_dir(dir);
-    if (latest) read_and_print_file(latest);
-    else g_printerr("No JSON file found in %s\n", dir);
+    if (latest) {
+      syslog(LOG_INFO, "lecture et affichage du dernier json trouve dans %s",dir);
+      read_and_print_file(latest);
+      syslog(LOG_INFO, "======================fin de lecture et affichage  %s\n ..............debut de lenvoi................................\n====================",dir);
+      try_ship_file_to_node(latest, HTTP_TARGET, NULL);
+      syslog(LOG_INFO, "======================fin de lenvoi  %s====================\n",dir);
+    } else {
+      syslog(LOG_INFO, "======================AUCUN FICHIER TROUVE  %s====================\n",dir);
+      g_printerr("No JSON file found in %s\n", dir);
+    }
+    syslog(LOG_INFO, "======================AUCUN FICHIER TROUVE  %s V2====================\n",dir);
     g_free(latest); g_free(dir);
+    g_date_time_unref(now_local);
   }
 }
 
@@ -771,51 +682,11 @@ ClassTotals d = compute_delta(&now, prev);
 GDateTime* now_utc = g_date_time_new_now_utc();
 put_delta_in_minute(now_utc, cfg->dir, &d);
 g_date_time_unref(now_utc);
+      // syslog(LOG_INFO, "CUM now c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
+      //       now.car,now.bike,now.truck,now.bus,now.human,now.other,now.total);
+      // syslog(LOG_INFO, "DELTA   d c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
+      //       d.car,d.bike,d.truck,d.bus,d.human,d.other,d.total);
 
-      // 2) Gérer reset (rebase des cumulés)
-      // if (g_prev_reset_time[0]==0 || strcmp(rt, g_prev_reset_time)!=0) {
-      //   memcpy(g_prev_reset_time, rt, sizeof(g_prev_reset_time));
-      //   g_prev = now; // base = état actuel
-      // }
-
-      // 3) Calculer le delta/minute
-      // ClassTotals d = compute_delta(&now);
-      // g_prev = now;
-
-      // 4) Fenêtre 15 min
-      // GDateTime* now_utc = g_date_time_new_now_utc();
-      // GDateTime* blk = floor_to_15min(now_utc);
-      // int idx = minute_index_in_block(now_utc);
-
-      // Changement de fenêtre -> flush l’ancienne
-      // if (!g_block.block_start_utc || !g_date_time_equal(blk, g_block.block_start_utc)) {
-      //   if (g_block.filled > 0) write_block_json_to_sd_with_scenario(cfg->scenario);
-      //   start_new_block(blk);
-      // }
-
-      // Remplir la minute idx
-      // iso_min_bounds(now_utc, g_block.m[idx].from_iso, g_block.m[idx].to_iso);
-      // g_block.m[idx].delta   = d;
-      // g_block.m[idx].filled  = TRUE;
-      // if (idx+1 > g_block.filled) g_block.filled = idx+1;
-      syslog(LOG_INFO, "CUM now c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
-            now.car,now.bike,now.truck,now.bus,now.human,now.other,now.total);
-      syslog(LOG_INFO, "DELTA   d c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
-            d.car,d.bike,d.truck,d.bus,d.human,d.other,d.total);
-
-      // Si la fenêtre est complète (15/15) -> écrire fichier 15 min
-      // if (g_block.filled == 15) {
-      //   write_block_json_to_sd_with_scenario(cfg->scenario);
-      //   GDateTime* next_blk = g_date_time_add_minutes(g_block.block_start_utc, 15);
-      //   start_new_block(next_blk);
-      //   g_date_time_unref(next_blk);
-      // }
-
-      // Option: vérifier le dernier fichier du bon scénario
-      // verify_latest_json_on_all_disks_for(cfg->scenario);
-
-      // g_date_time_unref(blk);
-      // g_date_time_unref(now_utc);
     } else {
       syslog(LOG_WARNING, "HTTP %ld (no payload)", http_code);
     }
@@ -848,6 +719,8 @@ if (!g_block.block_start_utc) {
   // (réinitialise g_block.m[...] si besoin)
 } else if (!g_date_time_equal(g_block.block_start_utc, win)) {
   // ↙️ on vient de franchir un multiple de 15 → flush l’ancienne fenêtre
+  // write_block_json_to_sd(g_camera_serial);
+  if (!get_camera_serial(g_camera_serial)) strcpy(g_camera_serial,"unknown_camera");
   write_block_json_to_sd(g_camera_serial);
   // réinitialise la fenêtre
   g_date_time_unref(g_block.block_start_utc);
@@ -859,8 +732,168 @@ g_date_time_unref(win);
   tick_poll_and_store(&g_dir1);
   tick_poll_and_store(&g_dir2);
   // potentiellement flush si on vient d’entrer dans une nouvelle tranche 15’
-  maybe_flush_15min(g_dir1.user, g_dir1.pass);
+  // maybe_flush_15min(g_dir1.user, g_dir1.pass);
+  maybe_flush_15min();
   return G_SOURCE_CONTINUE;
+}
+static void day_string_europe_paris(GDateTime **now_local_out, char out_day[11]) {
+  GTimeZone *tz = g_time_zone_new_identifier("Europe/Paris");
+  GDateTime *now_local = g_date_time_new_now(tz);
+  gchar *day = g_date_time_format(now_local, "%Y-%m-%d"); // ex: 2025-09-24
+  g_strlcpy(out_day, day, 11);
+  g_free(day);
+  g_time_zone_unref(tz);
+  *now_local_out = now_local; // le caller fera unref
+}
+// Envoie JSON -> Node
+static gboolean http_post_json(const char* url, const char* api_key, const char* json, long* http_code_out) {
+  CURL *curl = curl_easy_init();
+  if (!curl) return FALSE;
+
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  if (api_key) {
+    char h[256]; snprintf(h, sizeof h, "X-API-Key: %s", api_key);
+    headers = curl_slist_append(headers, h);
+  }
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+
+  CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;
+  if (http_code_out) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  if (http_code_out) *http_code_out = http_code;
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  return (rc == CURLE_OK);
+}
+
+// Lit un fichier et l'envoie (puis, si succès 200/201, on peut le renommer ".sent")
+static void try_ship_file_to_node(const char* filepath, const char* url, const char* api_key) {
+  gchar *contents = NULL; gsize len = 0;
+  if (!g_file_get_contents(filepath, &contents, &len, NULL)) {
+    syslog(LOG_WARNING, "Cannot read %s to ship", filepath);
+    return;
+  }
+  long code = 0;
+  gboolean ok = http_post_json(url, api_key, contents, &code);
+  if (ok && (code == 200 || code == 201)) {
+    syslog(LOG_INFO, "Shipped OK %s (HTTP %ld)", filepath, code);
+    gchar* sent = g_strconcat(filepath, ".sent", NULL);
+    g_rename(filepath, sent); // garde une trace, évite de supprimer brutalement
+    g_free(sent);
+  } else {
+    syslog(LOG_WARNING, "Ship failed %s (HTTP %ld)", filepath, code);
+  }
+  g_free(contents);
+}
+static void resend_pending_today(const char* base_dir, const char* serial, const char* url, const char* api_key) {
+  char ymd[11]; GDateTime *now_local = NULL;
+  day_string_europe_paris(&now_local, ymd);
+  gchar* dir = g_strdup_printf("%s/aoa_counts/%s/%s", base_dir, serial, ymd);
+  GDir* d = g_dir_open(dir, 0, NULL);
+  if (!d) { g_free(dir); if(now_local) g_date_time_unref(now_local); return; }
+
+  const gchar* name;
+  while ((name = g_dir_read_name(d)) != NULL) {
+    if (g_str_has_suffix(name, ".json") && !g_str_has_suffix(name, ".json.sent")) {
+      gchar* fp = g_build_filename(dir, name, NULL);
+      try_ship_file_to_node(fp, url, api_key);
+      g_free(fp);
+    }
+  }
+  g_dir_close(d);
+  g_free(dir);
+  if(now_local) g_date_time_unref(now_local);
+}
+/* --- Test GET au démarrage : jsonplaceholder --- */
+// static void curl_test_get_jsonplaceholder(void) {
+//   CURL *curl = curl_easy_init();
+//   if (!curl) { syslog(LOG_WARNING, "curl init failed (test)"); return; }
+
+//   struct MemoryStruct buf = {0};
+//   curl_easy_setopt(curl, CURLOPT_URL, "http://192.168.1.104:3000");
+//   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+//   curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&buf);
+//   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+//   CURLcode rc = curl_easy_perform(curl);
+//   long http_code = 0;
+//   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+//   if (rc != CURLE_OK) {
+//     syslog(LOG_WARNING, "TEST GET failed: %s", curl_easy_strerror(rc));
+//   } else {
+//     /* évite d’inonder les logs : tronque à 300 caractères */
+//     int show = (buf.size > 300) ? 300 : (int)buf.size;
+//     syslog(LOG_INFO, "TEST GET code=%ld body=%.*s", http_code, show, buf.memory ? buf.memory : "");
+//   }
+//   syslog(LOG_INFO, "Resending pending files of today...");
+//   // on renvoie les fichiers non encore envoyés de la journée
+//   for (GList* n = g_list_first(disks_list); n; n = g_list_next(n)) {
+//     disk_item_t* d = n->data;
+//     if (!d || !d->storage_path) continue;
+//     char serial[64]={0};
+//     if (!get_camera_serial(serial)) strcpy(serial,"unknown_camera");
+//     syslog(LOG_INFO, "Resending pending files for serial %s", serial);
+//     // resend_pending_today(d->storage_path, serial, "http://192.168.1.104:3000/api/enregistrements/ingest-batch-from-acap", NULL);
+//     syslog(LOG_INFO, "End of Resending pending files for serial %s", serial);
+//   }
+//   syslog(LOG_INFO, "Resending pending files of today... NO JUST DONE");
+  
+//   free(buf.memory);
+//   curl_easy_cleanup(curl);
+// }
+
+static void list_all_files_with_parent(const char *root_dir) {
+  if (!root_dir || !g_file_test(root_dir, G_FILE_TEST_IS_DIR)) {
+    syslog(LOG_WARNING, "list: root not a dir: %s", root_dir ? root_dir : "(null)");
+    return;
+  }
+
+  GQueue *stack = g_queue_new();
+  g_queue_push_tail(stack, g_strdup(root_dir));
+
+  while (!g_queue_is_empty(stack)) {
+    char *dirpath = (char*)g_queue_pop_head(stack);
+    GDir *dir = g_dir_open(dirpath, 0, NULL);
+    if (!dir) {
+      syslog(LOG_WARNING, "list: cannot open %s", dirpath);
+      g_free(dirpath);
+      continue;
+    }
+
+    const char *name;
+    while ((name = g_dir_read_name(dir)) != NULL) {
+      if (g_strcmp0(name, ".") == 0 || g_strcmp0(name, "..") == 0) continue;
+
+      char *full = g_build_filename(dirpath, name, NULL);
+      if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
+        /* dossier : empiler pour descente récursive */
+        g_queue_push_tail(stack, full);
+      } else if (g_file_test(full, G_FILE_TEST_IS_REGULAR)) {
+        /* fichier : log parent + nom */
+        char *parent = g_path_get_dirname(full);
+        /* -> syslog (visible dans la console de la caméra) */
+        syslog(LOG_INFO, "FILE  parent=%s   name=%s", parent, name);
+        /* si tu préfères stdout: g_print("FILE  parent=%s   name=%s\n", parent, name); */
+        g_free(parent);
+        g_free(full);
+      } else {
+        /* ni fichier ni dir (lien, etc.) */
+        g_free(full);
+      }
+    }
+    g_dir_close(dir);
+    g_free(dirpath);
+  }
+
+  g_queue_free(stack);
 }
 
 /*** ---- main : init storage, s'abonner, timer pour poll ---- ***/
@@ -902,7 +935,8 @@ int main(void)
   loop = g_main_loop_new(NULL, FALSE);
   g_unix_signal_add(SIGTERM, signal_handler, NULL);
   g_unix_signal_add(SIGINT, signal_handler, NULL);
-
+  // get_camera_serial(g_camera_serial, "champlein", "696969");
+  // syslog(LOG_INFO, "Camera serial: %s", g_camera_serial);
   // Config du polling (à adapter)
   // static PollCfg cfg;
   // snprintf(cfg.cam_url, sizeof cfg.cam_url, "http://192.168.1.51/local/objectanalytics/control.cgi");
@@ -910,13 +944,18 @@ int main(void)
   // snprintf(cfg.pass, sizeof cfg.pass, "696969");        // <-- remplace
   // snprintf(cfg.scenario, sizeof cfg.scenario, "2");     // ou "S1" (UID)
   // snprintf(cfg.api_version, sizeof cfg.api_version, "1.6");
-  snprintf(g_dir1.cam_url,sizeof g_dir1.cam_url,"http://192.168.1.51/local/objectanalytics/control.cgi");
+  snprintf(g_dir1.cam_url,sizeof g_dir1.cam_url,"http://127.0.0.1/local/objectanalytics/control.cgi");
   strcpy(g_dir1.user,"champlein"); strcpy(g_dir1.pass,"696969");
-  strcpy(g_dir1.scenario,"4"); strcpy(g_dir1.api_version,"1.6");
+  strcpy(g_dir1.scenario,NUM_SCENARIO_DIR1_OU_DVG); strcpy(g_dir1.api_version,"1.6");
   g_dir1.dir = DIR1; g_dir1.period_sec = 60;
 
-  g_dir2 = g_dir1; strcpy(g_dir2.scenario,"2"); g_dir2.dir = DIR2;
+  g_dir2 = g_dir1; strcpy(g_dir2.scenario,NUM_SCENARIO_DIR2_OU_GVD); g_dir2.dir = DIR2;
   // cfg.period_sec = 60;
+  // curl_test_get_jsonplaceholder();
+  
+  // char serial[64]={0};
+  // if (!get_camera_serial(serial)) strcpy(serial,"unknown");
+  // verify_latest_json_on_all_disks_for_serial(serial); // debug
 
   // Tick initial + toutes les period_sec
   // tick_poll_and_store(&cfg);
