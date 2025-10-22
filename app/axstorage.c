@@ -9,22 +9,42 @@
 #include <syslog.h>
 
 #include <curl/curl.h>
-#define HTTP_TARGET "http://192.168.1.104:3000/api/enregistrements/ingest-batch-from-acap"
+
+
+
+// #define HTTP_TARGET "http://192.168.1.45:3000/api/enregistrements/ingest-batch-from-acap"
+#define HTTP_TARGET "https://api.mycarcounter.fr/api/enregistrements/ingest-batch-from-acap"
+
+
+
+// Auth0 token configuration
+#define AUTH0_URL "https://dev-6xrnn215zh26wxwo.us.auth0.com/oauth/token"
+#define AUTH0_CLIENT_ID "vtJWEop6rfpRz59PoFmfni27Fe7iwI4Z"
+#define AUTH0_CLIENT_SECRET "W04lUw4exH82IV4CWPd3i7ObsYAIAlWYINicuJHTlHZuRseoLZvhUl8f0YIQwcCn"
+#define AUTH0_AUDIENCE "https://api.mycarcounter.fr"
+#define AUTH0_GRANT_TYPE "client_credentials"
+
+
 #define USER "champlein"
 #define PASS "696969"
 #define NUM_SCENARIO_DIR1_OU_DVG "4"  // <- à adapter selon ton scénario de comptage SUR LA CAMERA 
 #define NUM_SCENARIO_DIR2_OU_GVD "2"  // <- à adapter selon ton scénario de comptage SUR LA CAMERA 
+
+
 /* NEW: numéro de série global, utilisé aux flush 15' et on SIGTERM */
 static char g_camera_serial[64] = "camera_name"; // par défaut
 static void verify_latest_json_on_all_disks_for_serial(const char* camera_serial);
 static void write_block_json_to_sd(const char* serial);
 static void day_string_europe_paris(GDateTime **now_local_out, char out_day[11]);
 static gboolean get_camera_serial(char out[64]);
-static void try_ship_file_to_node(const char* filepath, const char* node_url, const char* api_key);
-static gboolean http_post_json(const char* url, const char* api_key, const char* json, long* http_code_out);
+static void try_ship_file_to_node(const char* filepath, const char* node_url);
+static gboolean http_post_json(const char* url, const char* json, long* http_code_out);
+static char *strstr_between(const char *hay, const char *start, const char *end);
+static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata);
+
 // static void  curl_test_get_jsonplaceholder(void);
-static void list_all_files_with_parent(const char *root_dir);
-static void resend_pending_today(const char* base_dir, const char* serial, const char* url, const char* api_key);
+// static void list_all_files_with_parent(const char *root_dir);
+static void resend_pending_today(const char* base_dir, const char* serial, const char* url);
 // static void verify_latest_json_on_all_disks_for(const char *scenario_str); // debug
 /*** ---- CURL buffer (reprend ton hello.c) ---- ***/
 struct MemoryStruct
@@ -32,6 +52,128 @@ struct MemoryStruct
   char *memory;
   size_t size;
 };
+// petit buffer mémoire pour récupérer les réponses HTTP
+struct mem
+{
+  char *p;
+  size_t n;
+};
+// Auth0 token globals
+static char g_access_token[2046] = {0};
+static time_t g_token_expires_at = 0;
+
+// Function to fetch Auth0 access token
+static int fetch_auth0_token(char err[256])
+{
+  CURL *curl = curl_easy_init();
+  if (!curl)
+  {
+    snprintf(err, 256, "curl init fail");
+    return 0;
+  }
+
+  char post_data[1024];
+  snprintf(post_data, sizeof(post_data),
+           "grant_type=%s&client_id=%s&client_secret=%s&audience=%s",
+           AUTH0_GRANT_TYPE, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET, AUTH0_AUDIENCE);
+
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+
+  struct mem m = {0};
+
+  curl_easy_setopt(curl, CURLOPT_URL, AUTH0_URL);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &m);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+  CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+
+  if (rc != CURLE_OK || http_code != 200)
+  {
+    snprintf(err, 256, "Auth0 request failed: %s HTTP %ld", curl_easy_strerror(rc), http_code);
+    free(m.p);
+    return 0;
+  }
+
+  // Parse JSON response
+  char *access_token = strstr_between(m.p, "\"access_token\":\"", "\"");
+  char *expires_in_str = strstr_between(m.p, "\"expires_in\":", ",");
+
+  if (!access_token || !expires_in_str)
+  {
+    snprintf(err, 256, "Invalid Auth0 response");
+    free(access_token);
+    free(expires_in_str);
+    free(m.p);
+    return 0;
+  }
+
+  int expires_in = atoi(expires_in_str);
+  time_t now = time(NULL);
+  g_token_expires_at = now + expires_in - 60; // refresh 1 min early
+
+  strncpy(g_access_token, access_token, sizeof(g_access_token) - 1);
+  g_access_token[sizeof(g_access_token) - 1] = '\0';
+
+  free(access_token);
+  free(expires_in_str);
+  free(m.p);
+  return 1;
+}
+
+// Function to get valid access token
+static const char *get_access_token(char err[256])
+{
+  time_t now = time(NULL);
+  if (g_access_token[0] == '\0' || now >= g_token_expires_at)
+  {
+    if (!fetch_auth0_token(err))
+    {
+      syslog(LOG_WARNING, "token on get func  %s (HTTP )", g_access_token);
+      return NULL;
+    }
+  }
+  return g_access_token;
+}
+// always comment code
+// Parsing léger: on cherche un asset .eap et on récupère son browser_download_url
+static char *strstr_between(const char *hay, const char *start, const char *end)
+{
+  const char *s = strstr(hay, start);
+  if (!s)
+    return NULL;
+  s += strlen(start);
+  const char *e = strstr(s, end);
+  if (!e)
+    return NULL;
+  size_t n = (size_t)(e - s);
+  char *out = (char *)malloc(n + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, s, n);
+  out[n] = '\0';
+  return out;
+}
+static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+  struct mem *m = (struct mem *)userdata;
+  size_t add = size * nmemb;
+  char *np = (char *)realloc(m->p, m->n + add + 1);
+  if (!np)
+    return 0;
+  m->p = np;
+  memcpy(m->p + m->n, ptr, add);
+  m->n += add;
+  m->p[m->n] = '\0';
+  return add;
+}
 
 // static char g_camera_serial[64] = "axis-b8a44f46ce99"; // par défaut
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -323,12 +465,12 @@ static void subscribe_cb(gchar *storage_id, gpointer user_data, GError *error)
         char serial[64]={0};
         if (!get_camera_serial(serial)) strcpy(serial,"unknown_camera");
         syslog(LOG_INFO, "Resending pending files for serial %s", serial);
-        resend_pending_today(d->storage_path, serial, HTTP_TARGET, NULL);
+        resend_pending_today(d->storage_path, serial, HTTP_TARGET);
 
     // g_timeout_add_seconds(5, (GSourceFunc)curl_test_get_jsonplaceholder, NULL);
       // après setup AXStorage, par ex.:
-    const char *base = "/var/spool/storage/areas/SD_DISK/axstorage/aoa_counts";
-    list_all_files_with_parent(base);
+    // const char *base = "/var/spool/storage/areas/SD_DISK/axstorage/aoa_counts";
+    // list_all_files_with_parent(base);
   
   }
 }
@@ -595,7 +737,7 @@ static void verify_latest_json_on_all_disks_for_serial(const char* camera_serial
       syslog(LOG_INFO, "lecture et affichage du dernier json trouve dans %s",dir);
       read_and_print_file(latest);
       syslog(LOG_INFO, "======================fin de lecture et affichage  %s\n ..............debut de lenvoi................................\n====================",dir);
-      try_ship_file_to_node(latest, HTTP_TARGET, NULL);
+      try_ship_file_to_node(latest, HTTP_TARGET);
       syslog(LOG_INFO, "======================fin de lenvoi  %s====================\n",dir);
     } else {
       syslog(LOG_INFO, "======================AUCUN FICHIER TROUVE  %s====================\n",dir);
@@ -746,16 +888,27 @@ static void day_string_europe_paris(GDateTime **now_local_out, char out_day[11])
   *now_local_out = now_local; // le caller fera unref
 }
 // Envoie JSON -> Node
-static gboolean http_post_json(const char* url, const char* api_key, const char* json, long* http_code_out) {
+static gboolean http_post_json(const char* url, const char* json, long* http_code_out) {
   CURL *curl = curl_easy_init();
   if (!curl) return FALSE;
 
   struct curl_slist *headers = NULL;
   headers = curl_slist_append(headers, "Content-Type: application/json");
-  if (api_key) {
-    char h[256]; snprintf(h, sizeof h, "X-API-Key: %s", api_key);
-    headers = curl_slist_append(headers, h);
+  // Add Auth0 Bearer token for authorization
+  char err[256];
+  const char *token = get_access_token(err);
+  if (token)
+  {
+    char auth_header[2048 + 20];
+    snprintf(auth_header, sizeof auth_header, "Authorization: Bearer %s", token);
+    syslog(6, "Authorization: Bearer %s", token);
+    headers = curl_slist_append(headers, auth_header);
   }
+  else
+  {
+    syslog(LOG_WARNING, "Failed to get Auth0 token: %s", err);
+  }
+
 
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -774,14 +927,14 @@ static gboolean http_post_json(const char* url, const char* api_key, const char*
 }
 
 // Lit un fichier et l'envoie (puis, si succès 200/201, on peut le renommer ".sent")
-static void try_ship_file_to_node(const char* filepath, const char* url, const char* api_key) {
+static void try_ship_file_to_node(const char* filepath, const char* url) {
   gchar *contents = NULL; gsize len = 0;
   if (!g_file_get_contents(filepath, &contents, &len, NULL)) {
     syslog(LOG_WARNING, "Cannot read %s to ship", filepath);
     return;
   }
   long code = 0;
-  gboolean ok = http_post_json(url, api_key, contents, &code);
+  gboolean ok = http_post_json(url, contents, &code);
   if (ok && (code == 200 || code == 201)) {
     syslog(LOG_INFO, "Shipped OK %s (HTTP %ld)", filepath, code);
     gchar* sent = g_strconcat(filepath, ".sent", NULL);
@@ -792,7 +945,7 @@ static void try_ship_file_to_node(const char* filepath, const char* url, const c
   }
   g_free(contents);
 }
-static void resend_pending_today(const char* base_dir, const char* serial, const char* url, const char* api_key) {
+static void resend_pending_today(const char* base_dir, const char* serial, const char* url) {
   char ymd[11]; GDateTime *now_local = NULL;
   day_string_europe_paris(&now_local, ymd);
   gchar* dir = g_strdup_printf("%s/aoa_counts/%s/%s", base_dir, serial, ymd);
@@ -803,7 +956,7 @@ static void resend_pending_today(const char* base_dir, const char* serial, const
   while ((name = g_dir_read_name(d)) != NULL) {
     if (g_str_has_suffix(name, ".json") && !g_str_has_suffix(name, ".json.sent")) {
       gchar* fp = g_build_filename(dir, name, NULL);
-      try_ship_file_to_node(fp, url, api_key);
+      try_ship_file_to_node(fp, url);
       g_free(fp);
     }
   }
@@ -850,51 +1003,51 @@ static void resend_pending_today(const char* base_dir, const char* serial, const
 //   curl_easy_cleanup(curl);
 // }
 
-static void list_all_files_with_parent(const char *root_dir) {
-  if (!root_dir || !g_file_test(root_dir, G_FILE_TEST_IS_DIR)) {
-    syslog(LOG_WARNING, "list: root not a dir: %s", root_dir ? root_dir : "(null)");
-    return;
-  }
+// static void list_all_files_with_parent(const char *root_dir) {
+//   if (!root_dir || !g_file_test(root_dir, G_FILE_TEST_IS_DIR)) {
+//     syslog(LOG_WARNING, "list: root not a dir: %s", root_dir ? root_dir : "(null)");
+//     return;
+//   }
 
-  GQueue *stack = g_queue_new();
-  g_queue_push_tail(stack, g_strdup(root_dir));
+//   GQueue *stack = g_queue_new();
+//   g_queue_push_tail(stack, g_strdup(root_dir));
 
-  while (!g_queue_is_empty(stack)) {
-    char *dirpath = (char*)g_queue_pop_head(stack);
-    GDir *dir = g_dir_open(dirpath, 0, NULL);
-    if (!dir) {
-      syslog(LOG_WARNING, "list: cannot open %s", dirpath);
-      g_free(dirpath);
-      continue;
-    }
+//   while (!g_queue_is_empty(stack)) {
+//     char *dirpath = (char*)g_queue_pop_head(stack);
+//     GDir *dir = g_dir_open(dirpath, 0, NULL);
+//     if (!dir) {
+//       syslog(LOG_WARNING, "list: cannot open %s", dirpath);
+//       g_free(dirpath);
+//       continue;
+//     }
 
-    const char *name;
-    while ((name = g_dir_read_name(dir)) != NULL) {
-      if (g_strcmp0(name, ".") == 0 || g_strcmp0(name, "..") == 0) continue;
+//     const char *name;
+//     while ((name = g_dir_read_name(dir)) != NULL) {
+//       if (g_strcmp0(name, ".") == 0 || g_strcmp0(name, "..") == 0) continue;
 
-      char *full = g_build_filename(dirpath, name, NULL);
-      if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
-        /* dossier : empiler pour descente récursive */
-        g_queue_push_tail(stack, full);
-      } else if (g_file_test(full, G_FILE_TEST_IS_REGULAR)) {
-        /* fichier : log parent + nom */
-        char *parent = g_path_get_dirname(full);
-        /* -> syslog (visible dans la console de la caméra) */
-        syslog(LOG_INFO, "FILE  parent=%s   name=%s", parent, name);
-        /* si tu préfères stdout: g_print("FILE  parent=%s   name=%s\n", parent, name); */
-        g_free(parent);
-        g_free(full);
-      } else {
-        /* ni fichier ni dir (lien, etc.) */
-        g_free(full);
-      }
-    }
-    g_dir_close(dir);
-    g_free(dirpath);
-  }
+//       char *full = g_build_filename(dirpath, name, NULL);
+//       if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
+//         /* dossier : empiler pour descente récursive */
+//         g_queue_push_tail(stack, full);
+//       } else if (g_file_test(full, G_FILE_TEST_IS_REGULAR)) {
+//         /* fichier : log parent + nom */
+//         char *parent = g_path_get_dirname(full);
+//         /* -> syslog (visible dans la console de la caméra) */
+//         syslog(LOG_INFO, "FILE  parent=%s   name=%s", parent, name);
+//         /* si tu préfères stdout: g_print("FILE  parent=%s   name=%s\n", parent, name); */
+//         g_free(parent);
+//         g_free(full);
+//       } else {
+//         /* ni fichier ni dir (lien, etc.) */
+//         g_free(full);
+//       }
+//     }
+//     g_dir_close(dir);
+//     g_free(dirpath);
+//   }
 
-  g_queue_free(stack);
-}
+//   g_queue_free(stack);
+// }
 
 /*** ---- main : init storage, s'abonner, timer pour poll ---- ***/
 int main(void)

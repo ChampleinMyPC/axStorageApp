@@ -13,11 +13,11 @@
         "setup": {
             "friendlyName": "axstorage",
             "appName": "axstorage",
-            "vendor": "MyPC Software T.Y.C.",
+            "vendor": "MyPC Software by C.",
             "embeddedSdkVersion": "3.0",
             "vendorUrl": "https://www.mypeoplecounter.com/fr/",
             "runMode": "never",
-            "version": "1.5.8"
+            "version": "1.5.9"
         }
     }
 }
