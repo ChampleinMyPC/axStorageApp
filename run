@@ -1,0 +1,8 @@
+ docker build --tag storage .
+
+
+ docker cp $(docker create storage):/opt/app ./build
+
+
+chmod +x build-acap-multiarch.sh
+./build-acap-multiarch.sh
