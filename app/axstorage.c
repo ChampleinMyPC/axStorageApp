@@ -9,7 +9,7 @@
 #include <syslog.h>
 
 #include <curl/curl.h>
-
+#include "myLib.h"
 // #define HTTP_TARGET "http://192.168.1.45:3000/api/enregistrements/ingest-batch-from-acap"
 #define HTTP_TARGET "https://api.mycarcounter.fr/api/enregistrements/ingest-batch-from-acap"
 
@@ -540,9 +540,9 @@ static void write_json_on_all_disks_serial(const char *basename,
     GDateTime *now_local = NULL;
     day_string_local(&now_local, ymd); // "YYYY-MM-DD"
     gchar *outdir = g_strdup_printf("%s/aoa_counts/%s/%s",
-      d->storage_path, camera_serial, ymd);
-      g_mkdir_with_parents(outdir, 0775);
-      syslog(LOG_INFO, "write_json: outdir=%s", outdir);
+                                    d->storage_path, camera_serial, ymd);
+    g_mkdir_with_parents(outdir, 0775);
+    syslog(LOG_INFO, "write_json: outdir=%s", outdir);
     // 2) nom horodaté (local pour l’unicité)
     gchar *ts = g_date_time_format(now_local, "%Y%m%dT%H%M%S");
     gchar *path = g_strdup_printf("%s/%s_%s.json", outdir, basename, ts);
@@ -558,7 +558,6 @@ static void write_json_on_all_disks_serial(const char *basename,
       syslog(LOG_WARNING, "open %s failed", path);
       syslog(LOG_WARNING, "fopen(%s) failed: %s", path, g_strerror(errno));
     }
- 
 
     g_free(path);
     g_free(ts);
@@ -1181,7 +1180,7 @@ static void resend_pending_today(const char *base_dir, const char *serial, const
 int main(void)
 {
   syslog(LOG_INFO, "Start AOA→SD app");
-
+  aoa_log_configuration_scenarios("127.0.0.1", USER, PASS); // pour logs AOA
   // 1) Lister les disques et s'abonner (reprend le pattern du sample Axis)
   GError *error = NULL;
   GList *disks = ax_storage_list(&error);

@@ -5,4 +5,5 @@
 
 
 chmod +x build-acap-multiarch.sh
+
 ./build-acap-multiarch.sh
