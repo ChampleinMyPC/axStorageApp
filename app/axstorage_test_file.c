@@ -11,21 +11,20 @@
 #include <curl/curl.h>
 #include "myLib.h"
 #include "./tests/tests.h"
-#include "./include/env.h"
-// #define HTTP_TARGET "http://192.168.1.45:3000/api/enregistrements/ingest-batch-from-acap"
+#define HTTP_TARGET "http://192.168.1.45:3000/api/enregistrements/ingest-batch-from-acap"
 // #define HTTP_TARGET "https://api.mycarcounter.fr/api/enregistrements/ingest-batch-from-acap"
 
 // Auth0 token configuration
-// #define AUTH0_URL "https://dev-6xrnn215zh26wxwo.us.auth0.com/oauth/token"
-// #define AUTH0_CLIENT_ID "vtJWEop6rfpRz59PoFmfni27Fe7iwI4Z"
-// #define AUTH0_CLIENT_SECRET "W04lUw4exH82IV4CWPd3i7ObsYAIAlWYINicuJHTlHZuRseoLZvhUl8f0YIQwcCn"
-// #define AUTH0_AUDIENCE "https://api.mycarcounter.fr"
-// #define AUTH0_GRANT_TYPE "client_credentials"
+#define AUTH0_URL "https://dev-6xrnn215zh26wxwo.us.auth0.com/oauth/token"
+#define AUTH0_CLIENT_ID "vtJWEop6rfpRz59PoFmfni27Fe7iwI4Z"
+#define AUTH0_CLIENT_SECRET "W04lUw4exH82IV4CWPd3i7ObsYAIAlWYINicuJHTlHZuRseoLZvhUl8f0YIQwcCn"
+#define AUTH0_AUDIENCE "https://api.mycarcounter.fr"
+#define AUTH0_GRANT_TYPE "client_credentials"
 
-// #define USER "root"
-// #define PASS "#Ch@mpIe1nMyCC"
-// #define NUM_SCENARIO_DIR1_OU_DVG "1" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
-// #define NUM_SCENARIO_DIR2_OU_GVD "2" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
+#define USER "root"
+#define PASS "#Ch@mpIe1nMyCC"
+#define NUM_SCENARIO_DIR1_OU_DVG "1" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
+#define NUM_SCENARIO_DIR2_OU_GVD "2" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
 
 /* NEW: numéro de série global, utilisé aux flush 15' et on SIGTERM */
 static char g_camera_serial[64] = "camera_name"; // par défaut
