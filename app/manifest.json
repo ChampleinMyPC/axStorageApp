@@ -11,13 +11,13 @@
     },
     "acapPackageConf": {
         "setup": {
-            "friendlyName": "axstorage_multi_scenarios",
-            "appName": "axstorage",
+            "friendlyName": "Application_de_comptage",
+            "appName": "axstorage_test_file",
             "vendor": "My People Counter Software by Champlein",
             "embeddedSdkVersion": "3.0",
             "vendorUrl": "https://www.mypeoplecounter.com/fr/",
             "runMode": "respawn",
-            "version": "1.5.9"
+            "version": "2.0.2"
         }
     }
 }

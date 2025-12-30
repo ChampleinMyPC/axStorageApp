@@ -11,20 +11,48 @@
 #include <curl/curl.h>
 #include "myLib.h"
 #include "./tests/tests.h"
-#define HTTP_TARGET "http://192.168.1.45:3000/api/enregistrements/ingest-batch-from-acap"
+#include "./include/env.h"
+#include "./camera_requests/inc/camera_req.h"
+
+
+
+// #define HTTP_TARGET "http://192.168.1.45:3000/api/enregistrements/ingest-batch-from-acap"
+static aoa_scenario_t g_valid[20]; // mais on a que 10 scénarios max sur la caméra
+static int g_valid_count = 0;
+
+// Toujours commenter : callback GLib => refresh + logs.
+static gboolean refresh_valid_scenarios_cb(gpointer user_data)
+{
+  (void)user_data;
+
+  long http = 0;
+  int n = 0;
+
+  // Toujours commenter : on s'appuie sur les macros USER/PASS de env.h (secrets non commit).
+  if (!aoa_refresh_valid_scenarios("127.0.0.1", USER, PASS, g_valid, 20, &n, &http))
+  {
+    syslog(LOG_WARNING, "Phase1: refresh_valid_scenarios FAILED (http=%ld)", http);
+    return TRUE; // Toujours commenter : on garde le timer actif
+  }
+
+  g_valid_count = n;
+  aoa_log_valid_scenarios_table(g_valid, g_valid_count, "Phase1");
+
+  return TRUE; // Toujours commenter : TRUE => timer récurrent
+}
 // #define HTTP_TARGET "https://api.mycarcounter.fr/api/enregistrements/ingest-batch-from-acap"
 
 // Auth0 token configuration
-#define AUTH0_URL "https://dev-6xrnn215zh26wxwo.us.auth0.com/oauth/token"
-#define AUTH0_CLIENT_ID "vtJWEop6rfpRz59PoFmfni27Fe7iwI4Z"
-#define AUTH0_CLIENT_SECRET "W04lUw4exH82IV4CWPd3i7ObsYAIAlWYINicuJHTlHZuRseoLZvhUl8f0YIQwcCn"
-#define AUTH0_AUDIENCE "https://api.mycarcounter.fr"
-#define AUTH0_GRANT_TYPE "client_credentials"
+// #define AUTH0_URL "https://dev-6xrnn215zh26wxwo.us.auth0.com/oauth/token"
+// #define AUTH0_CLIENT_ID "vtJWEop6rfpRz59PoFmfni27Fe7iwI4Z"
+// #define AUTH0_CLIENT_SECRET "W04lUw4exH82IV4CWPd3i7ObsYAIAlWYINicuJHTlHZuRseoLZvhUl8f0YIQwcCn"
+// #define AUTH0_AUDIENCE "https://api.mycarcounter.fr"
+// #define AUTH0_GRANT_TYPE "client_credentials"
 
-#define USER "root"
-#define PASS "#Ch@mpIe1nMyCC"
-#define NUM_SCENARIO_DIR1_OU_DVG "1" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
-#define NUM_SCENARIO_DIR2_OU_GVD "2" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
+// #define USER "root"
+// #define PASS "#Ch@mpIe1nMyCC"
+// #define NUM_SCENARIO_DIR1_OU_DVG "1" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
+// #define NUM_SCENARIO_DIR2_OU_GVD "2" // <- à adapter selon ton scénario de comptage SUR LA CAMERA
 
 /* NEW: numéro de série global, utilisé aux flush 15' et on SIGTERM */
 static char g_camera_serial[64] = "camera_name"; // par défaut
@@ -67,6 +95,12 @@ struct mem
 // Auth0 token globals
 static char g_access_token[2046] = {0};
 static time_t g_token_expires_at = 0;
+
+// Toujours commenter : table globale zone_id -> ZoneBlock*
+static GHashTable *g_zone_blocks = NULL;
+
+// Toujours commenter : début tranche 15 min "référence" (commune à toutes zones)
+static GDateTime *g_zone_block_start_local = NULL;
 
 // Function to fetch Auth0 access token
 static int fetch_auth0_token(char err[256])
@@ -199,32 +233,12 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
   return realsize;
 }
 /* ===== Aggregation 15 minutes ===== */
-typedef struct
-{
-  int car, bike, truck, bus, human, other, total;
-} ClassTotals;
-
-typedef struct
-{
-  char from_iso[32], to_iso[32]; // bords minute (local)
-  gboolean has_dir1, has_dir2;   // flags d'arrivée partielle
-  ClassTotals dir1, dir2;        // deltas/minute
-} MinuteEntry2;
-
-typedef struct
-{
-  GDateTime *block_start_local; /* début fenêtre 15 min (local) */
-  MinuteEntry2 m[15];           /* 15 buckets */
-  int filled;                   /* combien de minutes remplies */
-} Block15x2;
-
-static Block15x2 g_block = {0};
 
 // cumulés précédents indépendants par direction
-static ClassTotals g_prev_dir1 = {0};
-static ClassTotals g_prev_dir2 = {0};
-static char g_prev_reset_time_dir1[40] = {0};
-static char g_prev_reset_time_dir2[40] = {0};
+// static ClassTotals g_prev_dir1 = {0};
+// static ClassTotals g_prev_dir2 = {0};
+// static char g_prev_reset_time_dir1[40] = {0};
+// static char g_prev_reset_time_dir2[40] = {0};
 // static char g_prev_reset_time[40] = {0};
 
 typedef enum
@@ -253,72 +267,6 @@ static ClassTotals compute_delta(const ClassTotals *now, const ClassTotals *prev
   return d;
 }
 
-static void ensure_block_for_now(GDateTime *now_local)
-{
-  // si pas de bloc ou changement de tranche 15’
-  GDateTime *start = g_date_time_new_local(
-      g_date_time_get_year(now_local), g_date_time_get_month(now_local), g_date_time_get_day_of_month(now_local),
-      g_date_time_get_hour(now_local), (g_date_time_get_minute(now_local) / 15) * 15, 0);
-  if (!g_block.block_start_local ||
-      g_date_time_difference(now_local, g_block.block_start_local) >= 15 * 60 * G_TIME_SPAN_SECOND ||
-      g_date_time_difference(now_local, g_block.block_start_local) < 0)
-  {
-    if (g_block.block_start_local)
-      g_date_time_unref(g_block.block_start_local);
-    memset(&g_block, 0, sizeof(g_block));
-    g_block.block_start_local = start; // ownership
-  }
-  else
-  {
-    g_date_time_unref(start);
-  }
-}
-static int minute_index(GDateTime *now, GDateTime *start)
-{
-  gint64 secs = g_date_time_difference(now, start) / G_TIME_SPAN_SECOND;
-  if (secs < 0)
-    secs = 0;
-  int idx = (int)(secs / 60);
-  if (idx < 0)
-    idx = 0;
-  if (idx > 14)
-    idx = 14;
-  return idx;
-}
-
-static void put_delta_in_minute(GDateTime *now_local, DirKind dir, const ClassTotals *delta)
-{
-  ensure_block_for_now(now_local);
-  int idx = minute_index(now_local, g_block.block_start_local);
-
-  if (g_block.m[idx].from_iso[0] == 0)
-  {
-    // borne exacte de la minute (from inclusive, to exclusive)
-    GDateTime *from = g_date_time_new_local(
-        g_date_time_get_year(now_local), g_date_time_get_month(now_local), g_date_time_get_day_of_month(now_local),
-        g_date_time_get_hour(now_local), g_date_time_get_minute(now_local), 0);
-    GDateTime *to = g_date_time_add_seconds(from, 60);
-    gchar *f = g_date_time_format(from, "%Y-%m-%dT%H:%M:%S");
-    gchar *t = g_date_time_format(to, "%Y-%m-%dT%H:%M:%S");
-    g_strlcpy(g_block.m[idx].from_iso, f, sizeof g_block.m[idx].from_iso);
-    g_strlcpy(g_block.m[idx].to_iso, t, sizeof g_block.m[idx].to_iso);
-    g_free(f);
-    g_free(t);
-    g_date_time_unref(from);
-    g_date_time_unref(to);
-  }
-
-  if (dir == DIR1)
-  {
-    g_block.m[idx].dir1 = *delta;
-    g_block.m[idx].has_dir1 = TRUE;
-  }
-  else
-  {
-    g_block.m[idx].dir2 = *delta;
-    g_block.m[idx].has_dir2 = TRUE;
-  }
-}
 
 /* --- parse cumul depuis la réponse (sscanf naïf, suffisant pour ce JSON) --- */
 static void parse_cumul_totals(const char *json, ClassTotals *out, char reset_time[40])
@@ -382,7 +330,7 @@ static gboolean signal_handler(gpointer user_data)
   (void)user_data;
   if (loop)
   {
-    if (g_block.block_start_local && get_camera_serial(g_camera_serial))
+    if (g_zone_block_start_local && get_camera_serial(g_camera_serial))
       write_block_json_to_sd(g_camera_serial);
     g_main_loop_quit(loop);
   }
@@ -521,6 +469,269 @@ static void subscribe_cb(gchar *storage_id, gpointer user_data, GError *error)
     // list_all_files_with_parent(base);
   }
 }
+// Toujours commenter : crée la table si besoin + retourne le bloc de la zone.
+static ZoneBlock *zone_bucket_get_or_create(int zone_id)
+{
+  // Paramètre :
+  // - zone_id : ROI id extrait du nom de scénario (>= 1)
+  if (zone_id <= 0)
+    return NULL;
+
+  if (!g_zone_blocks)
+  {
+    // key=int direct, value=ZoneBlock* (free auto)
+    g_zone_blocks = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+  }
+
+  ZoneBlock *zb = (ZoneBlock *)g_hash_table_lookup(g_zone_blocks, GINT_TO_POINTER(zone_id));
+  if (!zb)
+  {
+    zb = (ZoneBlock *)g_malloc0(sizeof(*zb));
+    zb->zone_id = zone_id;
+    zb->block_start_local = NULL;
+    g_hash_table_insert(g_zone_blocks, GINT_TO_POINTER(zone_id), zb);
+  }
+
+  return zb;
+}
+// Toujours commenter : calcule/assure la tranche 15' + met le delta dans la minute courante.
+static void zone_bucket_add_delta(int zone_id, aoa_dir_t dir, const ClassTotals *delta, GDateTime *now_local)
+{
+  // Paramètres :
+  // - zone_id : ROI dynamique
+  // - dir : AOA_DIR_RTL (IN => dvg) ou AOA_DIR_LTR (OUT => gvd)
+  // - delta : deltas minute calculés pour un scenario_id
+  // - now_local : timestamp local (minute courante)
+  if (!delta || !now_local)
+    return;
+
+  ZoneBlock *zb = zone_bucket_get_or_create(zone_id);
+  if (!zb)
+    return;
+
+  // Toujours commenter : déterminer le "start 15 minutes" de la tranche en cours.
+  GDateTime *start = g_date_time_new_local(
+      g_date_time_get_year(now_local),
+      g_date_time_get_month(now_local),
+      g_date_time_get_day_of_month(now_local),
+      g_date_time_get_hour(now_local),
+      (g_date_time_get_minute(now_local) / 15) * 15,
+      0);
+
+  // Toujours commenter : gérer un changement de tranche global (commune).
+  if (!g_zone_block_start_local ||
+      g_date_time_difference(start, g_zone_block_start_local) != 0)
+  {
+    // On remplace la référence globale.
+    if (g_zone_block_start_local)
+      g_date_time_unref(g_zone_block_start_local);
+    g_zone_block_start_local = start; // ownership
+  }
+  else
+  {
+    g_date_time_unref(start);
+  }
+
+  // Toujours commenter : s'assurer que la zone est sur la même tranche.
+  if (!zb->block_start_local ||
+      g_date_time_difference(zb->block_start_local, g_zone_block_start_local) != 0)
+  {
+    if (zb->block_start_local)
+      g_date_time_unref(zb->block_start_local);
+    memset(zb->m, 0, sizeof(zb->m));
+    zb->block_start_local = g_date_time_ref(g_zone_block_start_local);
+  }
+
+  // Toujours commenter : index minute dans la tranche (0..14)
+  gint64 secs = g_date_time_difference(now_local, zb->block_start_local) / G_TIME_SPAN_SECOND;
+  if (secs < 0)
+    secs = 0;
+  int idx = (int)(secs / 60);
+  if (idx < 0)
+    idx = 0;
+  if (idx > 14)
+    idx = 14;
+
+  // Toujours commenter : init from/to de la minute si pas encore fait.
+  if (zb->m[idx].from_iso[0] == 0)
+  {
+    GDateTime *from = g_date_time_new_local(
+        g_date_time_get_year(now_local),
+        g_date_time_get_month(now_local),
+        g_date_time_get_day_of_month(now_local),
+        g_date_time_get_hour(now_local),
+        g_date_time_get_minute(now_local),
+        0);
+    GDateTime *to = g_date_time_add_seconds(from, 60);
+
+    gchar *f = g_date_time_format(from, "%Y-%m-%dT%H:%M:%S");
+    gchar *t = g_date_time_format(to, "%Y-%m-%dT%H:%M:%S");
+    g_strlcpy(zb->m[idx].from_iso, f, sizeof zb->m[idx].from_iso);
+    g_strlcpy(zb->m[idx].to_iso, t, sizeof zb->m[idx].to_iso);
+    g_free(f);
+    g_free(t);
+    g_date_time_unref(from);
+    g_date_time_unref(to);
+  }
+
+  // Toujours commenter : loi sacrée appliquée via dir métier.
+  if (dir == AOA_DIR_RTL)
+  {
+    // IN => dvg
+    zb->m[idx].dvg.car += delta->car;
+    zb->m[idx].dvg.bike += delta->bike;
+    zb->m[idx].dvg.truck += delta->truck;
+    zb->m[idx].dvg.bus += delta->bus;
+    zb->m[idx].dvg.human += delta->human;
+    zb->m[idx].dvg.other += delta->other;
+    zb->m[idx].dvg.total += delta->total;
+    zb->m[idx].has_dvg = TRUE;
+  }
+  else
+  {
+    // OUT => gvd
+    zb->m[idx].gvd.car += delta->car;
+    zb->m[idx].gvd.bike += delta->bike;
+    zb->m[idx].gvd.truck += delta->truck;
+    zb->m[idx].gvd.bus += delta->bus;
+    zb->m[idx].gvd.human += delta->human;
+    zb->m[idx].gvd.other += delta->other;
+    zb->m[idx].gvd.total += delta->total;
+    zb->m[idx].has_gvd = TRUE;
+  }
+}
+
+// Toujours commenter : construit le JSON backend multi-ROI à partir des buckets par zone.
+// Retour : string malloc() à free() par l'appelant.
+static char *build_backend_json_from_zone_buckets(const char *serial)
+{
+  // Paramètre :
+  // - serial : numéro de série caméra (peut être NULL)
+  if (!g_zone_blocks || !g_zone_block_start_local)
+    return NULL;
+
+  GString *js = g_string_new(NULL);
+
+  g_string_append_printf(js,
+                         "{"
+                         "\"cameraSerial\":\"%s\","
+                         "\"sensor-time\":{\"timezone\":\"Europe/Paris\"},"
+                         "\"content\":{\"element\":[",
+                         serial ? serial : "unknown");
+
+  gboolean first_elem = TRUE;
+
+  // Toujours commenter : itérer sur toutes les zones.
+  GHashTableIter it;
+  gpointer k = NULL, v = NULL;
+  g_hash_table_iter_init(&it, g_zone_blocks);
+
+  while (g_hash_table_iter_next(&it, &k, &v))
+  {
+    ZoneBlock *zb = (ZoneBlock *)v;
+    if (!zb || !zb->block_start_local)
+      continue;
+
+    // Toujours commenter : vérifier qu'il y a au moins une minute remplie.
+    gboolean any_min = FALSE;
+    for (int i = 0; i < 15; i++)
+    {
+      if (zb->m[i].from_iso[0] != 0 && (zb->m[i].has_dvg || zb->m[i].has_gvd))
+      {
+        any_min = TRUE;
+        break;
+      }
+    }
+    if (!any_min)
+      continue;
+
+    if (!first_elem)
+      g_string_append(js, ",");
+    first_elem = FALSE;
+
+    // Toujours commenter : un element = une zone_id.
+    g_string_append_printf(js,
+                           "{"
+                           "\"roi-id\":%d,"
+                           "\"data-type\":\"LINE\","
+                           "\"resolution\":\"ONE_MINUTE\","
+                           "\"measurement\":[",
+                           zb->zone_id);
+
+    gboolean first_meas = TRUE;
+    for (int i = 0; i < 15; i++)
+    {
+      if (zb->m[i].from_iso[0] == 0)
+        continue;
+      if (!(zb->m[i].has_dvg || zb->m[i].has_gvd))
+        continue;
+
+      if (!first_meas)
+        g_string_append(js, ",");
+      first_meas = FALSE;
+
+      // Toujours commenter : total = dvg + gvd.
+      ClassTotals tot = {
+          .car = zb->m[i].dvg.car + zb->m[i].gvd.car,
+          .bike = zb->m[i].dvg.bike + zb->m[i].gvd.bike,
+          .truck = zb->m[i].dvg.truck + zb->m[i].gvd.truck,
+          .bus = zb->m[i].dvg.bus + zb->m[i].gvd.bus,
+          .human = zb->m[i].dvg.human + zb->m[i].gvd.human,
+          .other = zb->m[i].dvg.other + zb->m[i].gvd.other,
+          .total = zb->m[i].dvg.total + zb->m[i].gvd.total,
+      };
+
+      g_string_append_printf(js,
+                             "{"
+                             "\"from\":\"%s\",\"to\":\"%s\","
+                             "\"counts\":{"
+                             "\"dvg\":["
+                             "{\"label\":\"car\",\"value\":%d},"
+                             "{\"label\":\"bike\",\"value\":%d},"
+                             "{\"label\":\"truck\",\"value\":%d},"
+                             "{\"label\":\"bus\",\"value\":%d},"
+                             "{\"label\":\"human\",\"value\":%d},"
+                             "{\"label\":\"other\",\"value\":%d}"
+                             "],"
+                             "\"gvd\":["
+                             "{\"label\":\"car\",\"value\":%d},"
+                             "{\"label\":\"bike\",\"value\":%d},"
+                             "{\"label\":\"truck\",\"value\":%d},"
+                             "{\"label\":\"bus\",\"value\":%d},"
+                             "{\"label\":\"human\",\"value\":%d},"
+                             "{\"label\":\"other\",\"value\":%d}"
+                             "],"
+                             "\"total\":["
+                             "{\"label\":\"car\",\"value\":%d},"
+                             "{\"label\":\"bike\",\"value\":%d},"
+                             "{\"label\":\"truck\",\"value\":%d},"
+                             "{\"label\":\"bus\",\"value\":%d},"
+                             "{\"label\":\"human\",\"value\":%d},"
+                             "{\"label\":\"other\",\"value\":%d}"
+                             "]"
+                             "}"
+                             "}",
+                             zb->m[i].from_iso, zb->m[i].to_iso,
+                             // dvg
+                             zb->m[i].dvg.car, zb->m[i].dvg.bike, zb->m[i].dvg.truck,
+                             zb->m[i].dvg.bus, zb->m[i].dvg.human, zb->m[i].dvg.other,
+                             // gvd
+                             zb->m[i].gvd.car, zb->m[i].gvd.bike, zb->m[i].gvd.truck,
+                             zb->m[i].gvd.bus, zb->m[i].gvd.human, zb->m[i].gvd.other,
+                             // total
+                             tot.car, tot.bike, tot.truck, tot.bus, tot.human, tot.other);
+    }
+
+    g_string_append(js, "]}"); // end measurement + element
+  }
+
+  g_string_append(js, "]}}"); // end element + content + root
+
+  // Toujours commenter : détacher la string malloc() depuis GString.
+  return g_string_free(js, FALSE);
+}
+
+
 static void write_json_on_all_disks_serial(const char *basename,
                                            const char *json,
                                            const char *camera_serial)
@@ -614,119 +825,51 @@ static gboolean get_camera_serial(char out[64])
 
 static void write_block_json_to_sd(const char *serial)
 {
-  if (!g_block.block_start_local)
-    return;
+char *json = build_backend_json_from_zone_buckets(serial);
+if (!json)
+  return;
 
-  GString *js = g_string_new(NULL);
-  g_string_append_printf(js,
-                         "{"
-                         "\"cameraSerial\":\"%s\","
-                         "\"sensor-time\":{\"timezone\":\"Europe/Paris\"},"
-                         "\"content\":{\"element\":[{"
-                         "\"roi-id\":1,"
-                         "\"data-type\":\"LINE\","
-                         "\"resolution\":\"ONE_MINUTE\","
-                         "\"measurement\":[",
-                         serial ? serial : "");
+// nom de fichier basé sur début de tranche
+gchar *start_str = g_date_time_format(g_zone_block_start_local, "%Y%m%dT%H%M");
+gchar *fname = g_strdup_printf("counts_%s_%s_15min", serial ? serial : "unknown", start_str);
 
-  gboolean first = TRUE;
-  for (int i = 0; i < 15; i++)
-  {
-    if (g_block.m[i].from_iso[0] == 0)
-      continue;
-    if (!first)
-      g_string_append(js, ",");
-    first = FALSE;
+// réutilise ta fonction d’écriture (dossier unique aoa_counts/)
+syslog(LOG_INFO, "ON ECRIT LE BLOCK DE 15 SUR EL DISK");
+write_json_on_all_disks_serial(fname, json, serial); // même signature qu’actuelle sans “scenario”
+syslog(LOG_INFO, "FIN ECRITURE LE BLOCK DE 15 SUR LE DISK \n");
+syslog(LOG_INFO, "AVANT LAPPEL DE VERIF POUR SERIAL ");
 
-    // total = dir1 + dir2, classe par classe
-    ClassTotals tot = {
-        .car = g_block.m[i].dir1.car + g_block.m[i].dir2.car,
-        .bike = g_block.m[i].dir1.bike + g_block.m[i].dir2.bike,
-        .truck = g_block.m[i].dir1.truck + g_block.m[i].dir2.truck,
-        .bus = g_block.m[i].dir1.bus + g_block.m[i].dir2.bus,
-        .human = g_block.m[i].dir1.human + g_block.m[i].dir2.human,
-        .other = g_block.m[i].dir1.other + g_block.m[i].dir2.other,
-        .total = g_block.m[i].dir1.total + g_block.m[i].dir2.total};
+g_free(start_str);
+g_free(fname);
+free(json);
 
-    g_string_append_printf(js,
-                           "{"
-                           "\"from\":\"%s\",\"to\":\"%s\","
-                           "\"counts\":{"
-                           "\"dvg\":["
-                           "{\"label\":\"car\",\"value\":%d},"
-                           "{\"label\":\"bike\",\"value\":%d},"
-                           "{\"label\":\"truck\",\"value\":%d},"
-                           "{\"label\":\"bus\",\"value\":%d},"
-                           "{\"label\":\"human\",\"value\":%d},"
-                           "{\"label\":\"other\",\"value\":%d}"
-                           "],"
-                           "\"gvd\":["
-                           "{\"label\":\"car\",\"value\":%d},"
-                           "{\"label\":\"bike\",\"value\":%d},"
-                           "{\"label\":\"truck\",\"value\":%d},"
-                           "{\"label\":\"bus\",\"value\":%d},"
-                           "{\"label\":\"human\",\"value\":%d},"
-                           "{\"label\":\"other\",\"value\":%d}"
-                           "],"
-                           "\"total\":["
-                           "{\"label\":\"car\",\"value\":%d},"
-                           "{\"label\":\"bike\",\"value\":%d},"
-                           "{\"label\":\"truck\",\"value\":%d},"
-                           "{\"label\":\"bus\",\"value\":%d},"
-                           "{\"label\":\"human\",\"value\":%d},"
-                           "{\"label\":\"other\",\"value\":%d}"
-                           "]"
-                           "}"
-                           "}",
-                           g_block.m[i].from_iso, g_block.m[i].to_iso,
-                           // dir1
-                           g_block.m[i].dir1.car, g_block.m[i].dir1.bike, g_block.m[i].dir1.truck,
-                           g_block.m[i].dir1.bus, g_block.m[i].dir1.human, g_block.m[i].dir1.other,
-                           // dir2
-                           g_block.m[i].dir2.car, g_block.m[i].dir2.bike, g_block.m[i].dir2.truck,
-                           g_block.m[i].dir2.bus, g_block.m[i].dir2.human, g_block.m[i].dir2.other,
-                           // total
-                           tot.car, tot.bike, tot.truck, tot.bus, tot.human, tot.other);
-  }
-  g_string_append(js, "]}]}}");
-
-  // nom de fichier basé sur le début de tranche 15’, sans “scenario”
-  gchar *start_str = g_date_time_format(g_block.block_start_local, "%Y%m%dT%H%M");
-  gchar *fname = g_strdup_printf("counts_%s_%s_15min", serial ? serial : "unknown", start_str);
-
-  // réutilise ta fonction d’écriture (dossier unique aoa_counts/)
-  syslog(LOG_INFO, "ON ECRIT LE BLOCK DE 15 SUR EL DISK");
-  write_json_on_all_disks_serial(fname, js->str, serial); // même signature qu’actuelle sans “scenario”
-  syslog(LOG_INFO, "FIN ECRITURE LE BLOCK DE 15 SUR LE DISK \n");
-  syslog(LOG_INFO, "AVANT LAPPEL DE VERIF POUR SERIAL ");
 
   verify_latest_json_on_all_disks_for_serial(serial); // debug
-  g_free(start_str);
-  g_free(fname);
-  g_string_free(js, TRUE);
 
-  // reset le bloc après écriture
-  g_date_time_unref(g_block.block_start_local);
-  memset(&g_block, 0, sizeof(g_block));
+  // g_string_free(js, TRUE);
 }
 static void maybe_flush_15min(void)
 {
-  if (!g_block.block_start_local)
+  // Toujours commenter : en multi-ROI, la tranche de référence est g_zone_block_start_local.
+  // Si NULL => aucun delta n'a encore été déposé, donc rien à flusher.
+  if (!g_zone_block_start_local)
     return;
 
   // si la minute courante est le début d’une nouvelle tranche 15’, on flush l’ancienne
   GDateTime *now = g_date_time_new_now_local();
   gint cur_min = g_date_time_get_minute(now);
-  gint blk_min = g_date_time_get_minute(g_block.block_start_local);
+  gint blk_min = g_date_time_get_minute(g_zone_block_start_local);
+
   // changement de tranche si cur_min/15 != blk_min/15 OU si heure/jour a bougé
   gboolean tranche_change =
       (cur_min / 15 != blk_min / 15) ||
-      (g_date_time_get_hour(now) != g_date_time_get_hour(g_block.block_start_local)) ||
-      (g_date_time_get_day_of_month(now) != g_date_time_get_day_of_month(g_block.block_start_local));
+      (g_date_time_get_hour(now) != g_date_time_get_hour(g_zone_block_start_local)) ||
+      (g_date_time_get_day_of_month(now) != g_date_time_get_day_of_month(g_zone_block_start_local));
 
   syslog(LOG_INFO, "maybe_flush_15: now=%02d blk=%02d",
          g_date_time_get_minute(now),
-         g_date_time_get_minute(g_block.block_start_local));
+         g_date_time_get_minute(g_zone_block_start_local));
+
   if (tranche_change)
   {
     syslog(LOG_INFO, "la tranche a changé on écrit le block de 15");
@@ -734,14 +877,45 @@ static void maybe_flush_15min(void)
     char serial[64] = {0};
     if (!get_camera_serial(serial))
       strcpy(serial, "unknown");
-    write_block_json_to_sd(serial);
-    // après écriture locale:
-    // on peut envoyer le fichier au node (si on a une API_KEY)
 
-    // la prochaine insertion recréera un nouveau bloc dans ensure_block_for_now()
+    // Toujours commenter : écrit le JSON multi-ROI (content.element[]) depuis g_zone_blocks.
+    write_block_json_to_sd(serial);
+
+    // -----------------------------------------------------------------
+    // Reset après flush (obligatoire pour éviter double compte)
+    // -----------------------------------------------------------------
+
+    if (g_zone_block_start_local)
+    {
+      g_date_time_unref(g_zone_block_start_local);
+      g_zone_block_start_local = NULL;
+    }
+
+    if (g_zone_blocks)
+    {
+      // Libérer block_start_local de chaque ZoneBlock avant destroy
+      GHashTableIter it;
+      gpointer k = NULL, v = NULL;
+      g_hash_table_iter_init(&it, g_zone_blocks);
+
+      while (g_hash_table_iter_next(&it, &k, &v))
+      {
+        ZoneBlock *zb = (ZoneBlock *)v;
+        if (zb && zb->block_start_local)
+        {
+          g_date_time_unref(zb->block_start_local);
+          zb->block_start_local = NULL;
+        }
+      }
+
+      g_hash_table_destroy(g_zone_blocks);
+      g_zone_blocks = NULL;
+    }
   }
+
   g_date_time_unref(now);
 }
+
 
 /* --- Trouve le dernier .json dans <storage_path>/aoa_counts --- */
 static gchar *find_latest_json_in_dir(const gchar *dirpath)
@@ -781,6 +955,7 @@ static gchar *find_latest_json_in_dir(const gchar *dirpath)
 /* --- Lit un fichier et l'affiche en entier (JSON brut) --- */
 static void read_and_print_file(const gchar *filepath)
 {
+  return;
   g_print("\n====================start_new=====================");
   // syslog(LOG_INFO, "Reading %s", filepath);
   if (!filepath)
@@ -854,6 +1029,51 @@ typedef struct
   DirKind dir;         // <- quel sens on remplit
   gint period_sec;     // cadence
 } PollCfg;
+typedef struct
+{
+  ClassTotals prev;
+  char reset_time[40];
+  gboolean inited;
+} ScenarioState;
+
+static GHashTable *g_state_by_scenario_id = NULL;
+
+static ScenarioState *get_or_create_state(int scenario_id)
+{
+    if (scenario_id <= 0)
+        return NULL;
+
+    if (!g_state_by_scenario_id)
+    {
+        g_state_by_scenario_id =
+            g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    }
+
+    ScenarioState *st =
+        g_hash_table_lookup(g_state_by_scenario_id, GINT_TO_POINTER(scenario_id));
+
+    if (!st)
+    {
+        st = g_malloc0(sizeof(*st));
+        st->inited = FALSE;
+        g_hash_table_insert(
+            g_state_by_scenario_id,
+            GINT_TO_POINTER(scenario_id),
+            st);
+    }
+
+    return st;
+}
+// Toujours commenter : retrouve le scénario validé (Phase 1) à partir d'un scenario_id Axis.
+static const aoa_scenario_t *find_valid_by_scenario_id(int scenario_id)
+{
+    for (int i = 0; i < g_valid_count; i++)
+    {
+        if (g_valid[i].scenario_id == scenario_id)
+            return &g_valid[i];
+    }
+    return NULL;
+}
 
 static gboolean tick_poll_and_store(gpointer user_data)
 {
@@ -917,14 +1137,32 @@ static gboolean tick_poll_and_store(gpointer user_data)
       ClassTotals now = {0};
       parse_cumul_totals(chunk.memory, &now, rt);
       // choisir les bons "prev"/"reset" selon la direction
-      ClassTotals *prev = (cfg->dir == DIR1) ? &g_prev_dir1 : &g_prev_dir2;
-      char *prev_rt = (cfg->dir == DIR1) ? g_prev_reset_time_dir1 : g_prev_reset_time_dir2;
+      int scenario_id = atoi(cfg->scenario);
+      ScenarioState *st = get_or_create_state(scenario_id);
+
+      ClassTotals *prev = NULL;
+      char *prev_rt = NULL;
+
+      if (st)
+      {
+        prev = &st->prev;
+        prev_rt = st->reset_time;
+      }
+      else
+      {
+        syslog(LOG_ERR, "Phase2: cannot alloc ScenarioState (scenario=%d)", scenario_id);
+        // cleanup et continue
+      }
 
       // reset si resetTime a changé
-      if (prev_rt[0] == 0 || strcmp(rt, prev_rt) != 0)
+      if ((st && !st->inited) || prev_rt[0] == 0 || strcmp(rt, prev_rt) != 0)
       {
         g_strlcpy(prev_rt, rt, 40);
         *prev = now; // rebasing
+        if (st) st->inited = TRUE;
+        syslog(LOG_INFO,
+              "Phase2: resetTime changed (scenario=%d) -> minute sent with zero counts",
+              scenario_id);        
       }
 
       // delta et dépôt dans le bucket minute
@@ -932,12 +1170,23 @@ static gboolean tick_poll_and_store(gpointer user_data)
       *prev = now;
 
       GDateTime *now_local = g_date_time_new_now_local();
-      put_delta_in_minute(now_local, cfg->dir, &d);
+      // Toujours commenter : dépôt multi-ROI (Phase 2.2) -> agrégation par zone_id.
+      const aoa_scenario_t *sc = find_valid_by_scenario_id(scenario_id);
+      if (sc)
+      {
+          zone_bucket_add_delta(sc->zone_id, sc->dir, &d, now_local);
+      }
+      else
+      {
+          syslog(LOG_WARNING, "Phase2: scenario_id=%d absent de g_valid[] (refresh Phase1 ?)", scenario_id);
+      }
       g_date_time_unref(now_local);
-      // syslog(LOG_INFO, "CUM now c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
-      //       now.car,now.bike,now.truck,now.bus,now.human,now.other,now.total);
-      // syslog(LOG_INFO, "DELTA   d c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
-      //       d.car,d.bike,d.truck,d.bus,d.human,d.other,d.total);
+
+      syslog(LOG_ERR, "TOTAL ET DELTA DU SCENARIO %d", scenario_id);
+      syslog(LOG_INFO, "CUM now c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
+            now.car,now.bike,now.truck,now.bus,now.human,now.other,now.total);
+      syslog(LOG_INFO, "DELTA   d c=%d b=%d t=%d bus=%d h=%d o=%d tot=%d",
+            d.car,d.bike,d.truck,d.bus,d.human,d.other,d.total);
     }
     else
     {
@@ -950,51 +1199,37 @@ static gboolean tick_poll_and_store(gpointer user_data)
   curl_easy_cleanup(curl);
   return G_SOURCE_CONTINUE;
 }
-// calcule le début de fenêtre (local) : 00/15/30/45
-static GDateTime *floor15(GDateTime *now)
-{
-  int m = g_date_time_get_minute(now);
-  int q = (m / 15) * 15;
-  return g_date_time_new_local(g_date_time_get_year(now),
-                               g_date_time_get_month(now),
-                               g_date_time_get_day_of_month(now),
-                               g_date_time_get_hour(now), q, 0);
-}
-
 static PollCfg g_dir1, g_dir2;
 /* --- Tick chaque minute: poll + store + flush si nouvelle tranche 15’ --- */
 static gboolean minute_tick(gpointer unused)
 {
   (void)unused;
-  GDateTime *now = g_date_time_new_now_local();
-  GDateTime *win = floor15(now);
 
-  if (!g_block.block_start_local)
+  // 1) Poll : boucle sur tous les scénarios valides (Phase 1), sinon fallback legacy
+  if (g_valid_count > 0)
   {
-    g_block.block_start_local = g_date_time_ref(win);
-    // (réinitialise g_block.m[...] si besoin)
+    // 2) Flush : si on vient d’entrer dans une nouvelle tranche 15’
+    maybe_flush_15min();
+    for (int i = 0; i < g_valid_count; i++)
+    {
+      PollCfg tmp = g_dir1; // reprend cam_url/user/pass/api_version
+      snprintf(tmp.scenario, sizeof tmp.scenario, "%d", g_valid[i].scenario_id);
+      // tmp.dir = (g_valid[i].dir == AOA_DIR_RTL) ? DIR1 : DIR2; // RTL=IN=dvg, LTR=OUT=gvd
+      tick_poll_and_store(&tmp);
+      // syslog(LOG_INFO, "ON EST DANS LE IF DE MINIUTE TICK" );
+    }
   }
-  else if (!g_date_time_equal(g_block.block_start_local, win))
+  else
   {
-    // ↙️ on vient de franchir un multiple de 15 → flush l’ancienne fenêtre
-    // write_block_json_to_sd(g_camera_serial);
-    if (!get_camera_serial(g_camera_serial))
-      strcpy(g_camera_serial, "unknown_camera");
-    write_block_json_to_sd(g_camera_serial);
-    // réinitialise la fenêtre
-    g_date_time_unref(g_block.block_start_local);
-    g_block.block_start_local = g_date_time_ref(win);
-    // clear g_block.m[...] (flags dir1/dir2 à FALSE)
+    // syslog(LOG_INFO, "ON EST DANS LE ELSE DE MINIUTE TICK" );
+    tick_poll_and_store(&g_dir1);
+    tick_poll_and_store(&g_dir2);
   }
-  g_date_time_unref(win);
 
-  tick_poll_and_store(&g_dir1);
-  tick_poll_and_store(&g_dir2);
-  // potentiellement flush si on vient d’entrer dans une nouvelle tranche 15’
-  // maybe_flush_15min(g_dir1.user, g_dir1.pass);
-  maybe_flush_15min();
+
   return G_SOURCE_CONTINUE;
 }
+
 // Envoie JSON -> Node
 static gboolean http_post_json(const char *url, const char *json, long *http_code_out)
 {
@@ -1092,95 +1327,18 @@ static void resend_pending_today(const char *base_dir, const char *serial, const
   if (now_local)
     g_date_time_unref(now_local);
 }
-/* --- Test GET au démarrage : jsonplaceholder --- */
-// static void curl_test_get_jsonplaceholder(void) {
-//   CURL *curl = curl_easy_init();
-//   if (!curl) { syslog(LOG_WARNING, "curl init failed (test)"); return; }
-
-//   struct MemoryStruct buf = {0};
-//   curl_easy_setopt(curl, CURLOPT_URL, "http://192.168.1.104:3000");
-//   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-//   curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&buf);
-//   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-
-//   CURLcode rc = curl_easy_perform(curl);
-//   long http_code = 0;
-//   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-//   if (rc != CURLE_OK) {
-//     syslog(LOG_WARNING, "TEST GET failed: %s", curl_easy_strerror(rc));
-//   } else {
-//     /* évite d’inonder les logs : tronque à 300 caractères */
-//     int show = (buf.size > 300) ? 300 : (int)buf.size;
-//     syslog(LOG_INFO, "TEST GET code=%ld body=%.*s", http_code, show, buf.memory ? buf.memory : "");
-//   }
-//   syslog(LOG_INFO, "Resending pending files of today...");
-//   // on renvoie les fichiers non encore envoyés de la journée
-//   for (GList* n = g_list_first(disks_list); n; n = g_list_next(n)) {
-//     disk_item_t* d = n->data;
-//     if (!d || !d->storage_path) continue;
-//     char serial[64]={0};
-//     if (!get_camera_serial(serial)) strcpy(serial,"unknown_camera");
-//     syslog(LOG_INFO, "Resending pending files for serial %s", serial);
-//     // resend_pending_today(d->storage_path, serial, "http://192.168.1.104:3000/api/enregistrements/ingest-batch-from-acap", NULL);
-//     syslog(LOG_INFO, "End of Resending pending files for serial %s", serial);
-//   }
-//   syslog(LOG_INFO, "Resending pending files of today... NO JUST DONE");
-
-//   free(buf.memory);
-//   curl_easy_cleanup(curl);
-// }
-
-// static void list_all_files_with_parent(const char *root_dir) {
-//   if (!root_dir || !g_file_test(root_dir, G_FILE_TEST_IS_DIR)) {
-//     syslog(LOG_WARNING, "list: root not a dir: %s", root_dir ? root_dir : "(null)");
-//     return;
-//   }
-
-//   GQueue *stack = g_queue_new();
-//   g_queue_push_tail(stack, g_strdup(root_dir));
-
-//   while (!g_queue_is_empty(stack)) {
-//     char *dirpath = (char*)g_queue_pop_head(stack);
-//     GDir *dir = g_dir_open(dirpath, 0, NULL);
-//     if (!dir) {
-//       syslog(LOG_WARNING, "list: cannot open %s", dirpath);
-//       g_free(dirpath);
-//       continue;
-//     }
-
-//     const char *name;
-//     while ((name = g_dir_read_name(dir)) != NULL) {
-//       if (g_strcmp0(name, ".") == 0 || g_strcmp0(name, "..") == 0) continue;
-
-//       char *full = g_build_filename(dirpath, name, NULL);
-//       if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
-//         /* dossier : empiler pour descente récursive */
-//         g_queue_push_tail(stack, full);
-//       } else if (g_file_test(full, G_FILE_TEST_IS_REGULAR)) {
-//         /* fichier : log parent + nom */
-//         char *parent = g_path_get_dirname(full);
-//         /* -> syslog (visible dans la console de la caméra) */
-//         syslog(LOG_INFO, "FILE  parent=%s   name=%s", parent, name);
-//         /* si tu préfères stdout: g_print("FILE  parent=%s   name=%s\n", parent, name); */
-//         g_free(parent);
-//         g_free(full);
-//       } else {
-//         /* ni fichier ni dir (lien, etc.) */
-//         g_free(full);
-//       }
-//     }
-//     g_dir_close(dir);
-//     g_free(dirpath);
-//   }
-
-//   g_queue_free(stack);
-// }
 
 /*** ---- main : init storage, s'abonner, timer pour poll ---- ***/
 int main(void)
 {
   syslog(LOG_INFO, "Start AOA→SD app");
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+  // Phase 1 : refresh immédiat puis toutes les 10 minutes.
+  refresh_valid_scenarios_cb(NULL);
+  g_timeout_add_seconds(600, refresh_valid_scenarios_cb, NULL);
+
   aoa_log_configuration_scenarios("127.0.0.1", USER, PASS); // pour logs AOA
   test_camera_req_list_scenarios("127.0.0.1", USER, PASS); // pour logs AOA
 
@@ -1229,15 +1387,15 @@ int main(void)
   // snprintf(cfg.scenario, sizeof cfg.scenario, "2");     // ou "S1" (UID)
   // snprintf(cfg.api_version, sizeof cfg.api_version, "1.6");
   snprintf(g_dir1.cam_url, sizeof g_dir1.cam_url, "http://127.0.0.1/local/objectanalytics/control.cgi");
-  strcpy(g_dir1.user, "champlein");
-  strcpy(g_dir1.pass, "696969");
-  strcpy(g_dir1.scenario, NUM_SCENARIO_DIR1_OU_DVG);
+  strcpy(g_dir1.user, USER);
+  strcpy(g_dir1.pass, PASS);
+  // strcpy(g_dir1.scenario, NUM_SCENARIO_DIR1_OU_DVG);
   strcpy(g_dir1.api_version, "1.6");
   g_dir1.dir = DIR1;
   g_dir1.period_sec = 60;
 
   g_dir2 = g_dir1;
-  strcpy(g_dir2.scenario, NUM_SCENARIO_DIR2_OU_GVD);
+  // strcpy(g_dir2.scenario, NUM_SCENARIO_DIR2_OU_GVD);
   g_dir2.dir = DIR2;
   // cfg.period_sec = 60;
   // curl_test_get_jsonplaceholder();
@@ -1284,5 +1442,7 @@ int main(void)
   g_main_loop_unref(loop);
 
   syslog(LOG_INFO, "Finish AOA→SD app");
+    // Toujours commenter : cleanup global libcurl.
+  curl_global_cleanup();
   return EXIT_SUCCESS;
 }

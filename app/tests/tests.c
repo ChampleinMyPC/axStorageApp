@@ -144,7 +144,8 @@ void test_camera_req_list_scenarios(const char *ip, const char *user, const char
     syslog(LOG_INFO, "TEST(camera_req): got JSON (len=%zu, HTTP=%ld)", strlen(json), http);
 
     // Toujours commenter : debug brut (désactive si trop verbeux)
-    log_raw_chunks("TEST(camera_req)", json);
+    log_raw_chunks("TEST(camera_req)", "UNCOMMENT ON NEED");
+    // log_raw_chunks("TEST(camera_req)", json);
 
     // Toujours commenter : ICI on teste ta fonction cible
     aoa_scenario_t out[128];

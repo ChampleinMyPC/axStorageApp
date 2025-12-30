@@ -222,23 +222,23 @@ void aoa_log_raw_response(const char *tag, const char *s)
     }
 
     const char *prefix = tag ? tag : "AOA";
-    const size_t CHUNK = 900; // Toujours commenter : marge pour éviter les limites syslog
+    // const size_t CHUNK = 900; // Toujours commenter : marge pour éviter les limites syslog
     size_t len = strlen(s);
 
     syslog(LOG_INFO, "%s: raw response (len=%zu) BEGIN", prefix, len);
 
-    for (size_t off = 0; off < len; off += CHUNK)
-    {
-        // Toujours commenter : on coupe proprement sans modifier la source
-        char buf[CHUNK + 1];
-        size_t n = len - off;
-        if (n > CHUNK) n = CHUNK;
+    // for (size_t off = 0; off < len; off += CHUNK)
+    // {
+    //     // Toujours commenter : on coupe proprement sans modifier la source
+    //     char buf[CHUNK + 1];
+    //     size_t n = len - off;
+    //     if (n > CHUNK) n = CHUNK;
 
-        memcpy(buf, s + off, n);
-        buf[n] = '\0';
+    //     memcpy(buf, s + off, n);
+    //     buf[n] = '\0';
 
-        syslog(LOG_INFO, "%s: %s", prefix, buf);
-    }
+    //     syslog(LOG_INFO, "%s: %s", prefix, buf);
+    // }
 
     syslog(LOG_INFO, "%s: raw response END", prefix);
 }

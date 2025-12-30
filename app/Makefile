@@ -1,6 +1,7 @@
 PROG1	= $(shell jq -r '.acapPackageConf.setup.appName' manifest.json)
 OBJS1	= $(PROG1).c \
       camera_requests/src/camera_req.c \
+      src/compat_glib.c \
       tests/tests.c
 
 PROGS	= $(PROG1)

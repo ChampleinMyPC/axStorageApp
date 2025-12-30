@@ -5,6 +5,7 @@
 // Toujours commenter : endpoint remote (backend) pour ingest des batchs ACAP
 // ⚠️ ne pas commit une URL interne si elle est sensible
 #define HTTP_TARGET "https://api.mycarcounter.fr/api/enregistrements/ingest-batch-from-acap"
+// #define HTTP_TARGET "http://192.168.1.45:3000/api/enregistrements/ingest-batch-from-acap"
 
 // Toujours commenter : Auth0 token endpoint + paramètres client_credentials
 // ⚠️ idéalement : ne pas commiter AUTH0_CLIENT_SECRET (mettre dans un env.h local gitignored)
@@ -16,8 +17,8 @@
 
 // Toujours commenter : credentials caméra (DigestAuth / contrôle.cgi)
 // ⚠️ idéalement : ne pas commiter PASS (mettre dans un env.h local gitignored)
-#define USER "root"
-#define PASS "#Ch@mpIe1nMyCC"
+#define USER "carflow"
+#define PASS "C@r76240"
 
 // Toujours commenter : legacy (si encore utilisé) - scénarios “en dur”
 // NOTE : à terme vous tickez sur tous les scénarios valides listés via getConfiguration.
